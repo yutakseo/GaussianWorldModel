@@ -42,6 +42,31 @@ cd ../../../../..
 
 See [docs/pretraining.md](docs/pretraining.md).
 
+### Docker Compose
+
+The container entrypoint installs the system-Python dependencies, builds the
+CUDA extensions for `TORCH_CUDA_ARCH_LIST`, downloads the Splatt3r checkpoint,
+and links the partial DROID dataset automatically on first startup:
+
+```bash
+docker compose up --build -d
+docker compose logs -f gaussianwm
+docker compose exec gaussianwm bash
+```
+
+Setup results are cached in the `gaussianwm-setup-state` volume. Re-running
+`docker compose up` verifies the imports and skips completed compilation. To
+run setup manually or after changing dependencies:
+
+```bash
+docker compose exec gaussianwm bash scripts/setup_container.sh
+```
+
+Set `GWM_DOWNLOAD_SPLATT3R=0` in `docker-compose.yml` if the 3.1 GB Splatt3r
+checkpoint should not be downloaded automatically. Change
+`TORCH_CUDA_ARCH_LIST` when using a GPU architecture other than the RTX 2060's
+compute capability 7.5.
+
 ## 🏷️ License
 
 This repository is released under the MIT license.

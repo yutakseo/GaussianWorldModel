@@ -2,7 +2,7 @@
 
 export HYDRA_FULL_ERROR=1
 
-CUDA_VISIBLE_DEVICES=1,2,3,4
+CUDA_VISIBLE_DEVICES=0
 GPU_NUMS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 
 DATASET=droid
@@ -14,4 +14,7 @@ CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     gaussianwm/train_vae.py \
     --config-name train_vae \
     dataset=$DATASET \
+    train.batch_size=1 \
+    dataset.traj_transform_threads=4 \
+    dataset.traj_read_threads=4 \
     use_wandb=false

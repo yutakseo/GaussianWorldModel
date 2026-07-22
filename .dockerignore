@@ -12,3 +12,5 @@ data
 datasets
 outputs
 wandb
+logs
+third_party/splatt3r/checkpoints

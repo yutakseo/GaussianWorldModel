@@ -142,12 +142,29 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
     cprint(f"Demo completed! Results saved to {output_dir.absolute()}", 'blue')
 
 
-@hydra.main(config_path="../configs", config_name="train_gwm")
+@hydra.main(version_base=None, config_path="../configs", config_name="train_gwm")
 def main(cfg: DictConfig):
     demo_samples = 5
     checkpoint_dir = cfg.output_dir
     checkpoint_dir = Path(checkpoint_dir)
     output_dir = checkpoint_dir / 'demo_outputs'
+
+    # Training saves snapshots as model_<step>.pt / model_latest.pt.  Allow a
+    # checkpoint to be supplied through the existing `resume` config option.
+    checkpoint_path = (
+        Path(cfg.resume).expanduser()
+        if cfg.resume
+        else checkpoint_dir / "checkpoints" / "model_latest.pt"
+    )
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path(get_original_cwd()) / checkpoint_path
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"GWM checkpoint not found: {checkpoint_path}\n"
+            "The upstream repository does not currently publish pretrained "
+            "VAE/DiT weights. Train one with scripts/pretrain/dit.sh, or run "
+            "the demo with resume=/absolute/path/to/model_latest.pt."
+        )
 
     device = torch.device(cfg.device if torch.cuda.is_available() else 'cpu')
     cprint(f"Using device: {device}", 'blue')
@@ -160,7 +177,6 @@ def main(cfg: DictConfig):
     cprint("Creating model...", 'blue')
     model = GaussianPredictor(cfg.world_model).to(device)
     
-    checkpoint_path = checkpoint_dir / "checkpoints" / "model_latest.pth"
     cprint(f"Loading specific checkpoint: {checkpoint_path}", 'green')
     suffix = checkpoint_path.stem.replace('model', '')
     model.load_snapshot(checkpoint_path.parent, suffix=suffix)

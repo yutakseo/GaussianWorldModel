@@ -10,6 +10,8 @@ RUN apt-get update \
         curl \
         git \
         git-lfs \
+        libgl1 \
+        libglib2.0-0 \
         ninja-build \
         python3.10 \
         python3.10-dev \
@@ -23,10 +25,11 @@ RUN apt-get update \
 
 ENV GWM_PATH=/workspace
 ENV UV_LINK_MODE=copy
-ENV UV_PROJECT_ENVIRONMENT=/workspace/.venv
-ENV PATH=/workspace/.venv/bin:${PATH}
+ENV UV_SYSTEM_PYTHON=1
 ENV TORCH_CUDA_ARCH_LIST=7.5
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /workspace
 
-CMD ["bash"]
+ENTRYPOINT ["bash", "/workspace/scripts/container_entrypoint.sh"]
+CMD ["sleep", "infinity"]

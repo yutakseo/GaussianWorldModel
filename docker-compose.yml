@@ -13,17 +13,19 @@ services:
     environment:
       GWM_PATH: /workspace
       TORCH_CUDA_ARCH_LIST: "7.5"
+      DROID_DATASET_DIR: /workspace/datasets/droid_100
+      GWM_DOWNLOAD_SPLATT3R: "1"
       UV_LINK_MODE: copy
-      UV_PROJECT_ENVIRONMENT: /workspace/.venv
+      UV_SYSTEM_PYTHON: "1"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - .:/workspace
       - gaussianwm-uv-cache:/root/.cache/uv
-      # Hide a host/Windows .venv and keep a Linux-only environment here.
-      - gaussianwm-venv:/workspace/.venv
+      - gaussianwm-setup-state:/var/cache/gaussianwm
+    entrypoint: ["bash", "/workspace/scripts/container_entrypoint.sh"]
     command: sleep infinity
 
 volumes:
   gaussianwm-uv-cache:
-  gaussianwm-venv:
+  gaussianwm-setup-state:

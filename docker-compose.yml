@@ -1,0 +1,29 @@
+services:
+  gaussianwm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gaussianwm-dev:cuda12.1
+    container_name: gaussianwm-dev
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: "16gb"
+    gpus: all
+    environment:
+      GWM_PATH: /workspace
+      TORCH_CUDA_ARCH_LIST: "7.5"
+      UV_LINK_MODE: copy
+      UV_PROJECT_ENVIRONMENT: /workspace/.venv
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - .:/workspace
+      - gaussianwm-uv-cache:/root/.cache/uv
+      # Hide a host/Windows .venv and keep a Linux-only environment here.
+      - gaussianwm-venv:/workspace/.venv
+    command: sleep infinity
+
+volumes:
+  gaussianwm-uv-cache:
+  gaussianwm-venv:

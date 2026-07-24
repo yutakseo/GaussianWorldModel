@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: gaussianwm-dev:cuda12.1
+    image: gaussianwm-dev:cuda12.8
     container_name: gaussianwm-dev
     working_dir: /workspace
     stdin_open: true

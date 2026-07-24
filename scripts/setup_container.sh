@@ -30,6 +30,7 @@ export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/thir
 
 mkdir -p "${SETUP_STATE_DIR}"
 cd "${GWM_ROOT}"
+git config --global --add safe.directory "${GWM_ROOT}"
 
 if [[ -f .gitmodules ]] && [[ ! -f third_party/splatt3r/src/mast3r_src/dust3r/croco/models/curope/setup.py ]]; then
     log "Initializing Git submodules"

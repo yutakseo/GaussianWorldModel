@@ -113,6 +113,7 @@ export UV_SYSTEM_PYTHON=1
 export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/third_party/splatt3r/src/pixelsplat_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src/dust3r${PYTHONPATH:+:${PYTHONPATH}}"
 
 mkdir -p "${SETUP_STATE_DIR}" "${GWM_ROOT}/third_party"
+rm -f "${SETUP_STATE_DIR}/ready"
 cd "${GWM_ROOT}"
 git config --global --add safe.directory "${GWM_ROOT}"
 

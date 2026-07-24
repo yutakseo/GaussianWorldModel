@@ -16,7 +16,7 @@ model:
 # Training settings
 train:
   batch_size: 16
-  epochs: 200
+  epochs: 100
   accum_iter: 1
   eval_every: 5  # Evaluate every N epochs
   save_every: 10  # Save checkpoint every N epochs
@@ -35,7 +35,7 @@ optimizer:
 # Dataloader settings
 dataloader:
   # num_workers: 8
-  num_workers: 0
+  num_workers: 32
   pin_memory: false
   prefetch_factor: 2
 

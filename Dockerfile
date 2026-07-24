@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
@@ -22,7 +22,12 @@ RUN apt-get update \
     && uv python install 3.10 \
     && ln -sf "$(uv python find --python-preference only-managed 3.10)" /usr/local/bin/python3 \
     && ln -sf /usr/local/bin/python3 /usr/local/bin/python \
-    && uv pip install --system --python /usr/local/bin/python "setuptools==69.5.1" \
+    && uv pip install --system --python /usr/local/bin/python3 \
+        "pip>=24" \
+        "setuptools==69.5.1" \
+        wheel \
+    && ln -sf "$(dirname "$(uv python find --python-preference only-managed 3.10)")/pip" /usr/local/bin/pip \
+    && ln -sf "$(dirname "$(uv python find --python-preference only-managed 3.10)")/pip3" /usr/local/bin/pip3 \
     && git lfs install --system
 
 ENV GWM_PATH=/workspace
@@ -31,7 +36,8 @@ ENV UV_SYSTEM_PYTHON=1
 ENV UV_PYTHON=/usr/local/bin/python3
 ENV PYTHON_BIN=/usr/local/bin/python3
 ENV PATH=/usr/local/bin:${PATH}
-ENV TORCH_CUDA_ARCH_LIST=7.5
+ENV TORCH_CUDA_ARCH_LIST=auto
+ENV CUDA_HOME=/usr/local/cuda
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /workspace

@@ -44,9 +44,10 @@ See [docs/pretraining.md](docs/pretraining.md).
 
 ### Docker Compose
 
-The container entrypoint installs the system-Python dependencies, builds the
-CUDA extensions for `TORCH_CUDA_ARCH_LIST`, downloads the Splatt3r checkpoint,
-and links the partial DROID dataset automatically on first startup:
+The container uses Python 3.10 with PyTorch 2.5.1 and CUDA 12.1. Its entrypoint
+installs the exact dependency versions from `uv.lock`, restores the recursive
+Splatt3r/DUSt3R sources when necessary, builds the CUDA extensions, downloads
+the Splatt3r checkpoint, and links the partial DROID dataset automatically:
 
 ```bash
 docker compose up --build -d
@@ -55,17 +56,25 @@ docker compose exec gaussianwm bash
 ```
 
 Setup results are cached in the `gaussianwm-setup-state` volume. Re-running
-`docker compose up` verifies the imports and skips completed compilation. To
+`docker compose up` launches a small PyTorch3D CUDA kernel to verify that the
+cached extension supports the visible GPU before compilation is skipped. To
 run setup manually or after changing dependencies:
 
 ```bash
 docker compose exec gaussianwm bash scripts/setup_container.sh
 ```
 
-Set `GWM_DOWNLOAD_SPLATT3R=0` in `docker-compose.yml` if the 3.1 GB Splatt3r
-checkpoint should not be downloaded automatically. Change
-`TORCH_CUDA_ARCH_LIST` when using a GPU architecture other than the RTX 2060's
-compute capability 7.5.
+Set `GWM_DOWNLOAD_SPLATT3R=0` in `docker-compose.yml` if the Splatt3r checkpoint
+should not be downloaded automatically. `TORCH_CUDA_ARCH_LIST=auto` detects the
+compute capabilities of the GPUs visible to the container. For an image that
+will run on several GPU generations, set it before startup, for example:
+
+```bash
+TORCH_CUDA_ARCH_LIST='7.5;8.6' docker compose up --build -d
+```
+
+The DROID dataset is expected at `datasets/droid_100` on the host checkout and
+is linked to the training path `data/droid_100` inside the container.
 
 ## 🏷️ License
 

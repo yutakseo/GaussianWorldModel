@@ -8,7 +8,7 @@ GPU_NUMS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 DATASET=droid
 DATA_PATH=$GWM_PATH/data/
 
-CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
+CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES "${PYTHON_BIN:-python3}" -m torch.distributed.run \
     --nproc_per_node=$GPU_NUMS \
     --master_port 12345 \
     gaussianwm/train_diffusion.py \

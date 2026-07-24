@@ -24,6 +24,7 @@ fi
 
 export GWM_PATH="${GWM_ROOT}"
 export TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}"
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:--include cstdint}"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 export UV_SYSTEM_PYTHON=1
 export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/third_party/splatt3r/src/pixelsplat_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src/dust3r${PYTHONPATH:+:${PYTHONPATH}}"

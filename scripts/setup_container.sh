@@ -140,12 +140,14 @@ if [[ "${python_ready}" -ne 1 ]]; then
         --locked \
         --no-dev \
         --no-emit-project \
+        --emit-index-url \
         --no-hashes \
         --output-file "${requirements_file}" \
         >/dev/null
     uv pip sync \
         --system \
         --python "${PYTHON_BIN}" \
+        --index-strategy unsafe-best-match \
         "${requirements_file}"
     rm -f -- "${requirements_file}"
     uv pip install \

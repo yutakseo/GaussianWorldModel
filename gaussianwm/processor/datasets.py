@@ -227,6 +227,19 @@ class DroidDataset(IterableDataset):
 
         # Apply robomimic transform
         self.dataset = self.dataset.map(robomimic_transform, num_parallel_calls=48)
+
+        # make_interleaved_dataset() repeats its component datasets so mixtures
+        # can be sampled continuously.  PyTorch's IterableDataset, however,
+        # expects iteration to stop after the length reported by __len__.
+        # Without this cap a VAE epoch never finishes, checkpointing is never
+        # reached, and DataLoader warns once more than dataset_length samples
+        # have been yielded.
+        if split == "train":
+            self.dataset_length = int(self.dataset_length)
+        else:
+            # The validation pipeline caches at most one shuffle buffer.
+            self.dataset_length = min(int(self.dataset_length), int(shuffle_buffer_size))
+        self.dataset = self.dataset.take(self.dataset_length)
         
     def __iter__(self):
         """Iterate over the dataset."""

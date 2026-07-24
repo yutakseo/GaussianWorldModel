@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     gaussianwm/train_vae.py \
     --config-name train_vae \
     dataset=$DATASET \
-    train.batch_size=1 \
+    train.batch_size=8 \
     dataset.traj_transform_threads=4 \
     dataset.traj_read_threads=4 \
     use_wandb=false

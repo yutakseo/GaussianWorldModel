@@ -1,12 +1,31 @@
 ## Project-specific
+ckpt/
+checkpoints/
+runs/
+tensorboard/
 *.pth
 *.pt
 *.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.npy
 *.npz
+*.pkl
+*.pickle
+*.joblib
+*.tfrecord
+*.tfrecord-*
+*.record
+*.arrow
+*.parquet
+*.zarr/
 *.ply
 *.sbatch
 *.out
 *.err
+events.out.tfevents.*
 
 # IDE and editor files
 .vscode/
@@ -191,4 +210,4 @@ cython_debug/
 
 
 *.lock
-
+!uv.lock

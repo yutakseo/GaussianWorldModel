@@ -28,6 +28,9 @@ RUN apt-get update \
 ENV GWM_PATH=/workspace
 ENV UV_LINK_MODE=copy
 ENV UV_SYSTEM_PYTHON=1
+ENV UV_PYTHON=/usr/local/bin/python3
+ENV PYTHON_BIN=/usr/local/bin/python3
+ENV PATH=/usr/local/bin:${PATH}
 ENV TORCH_CUDA_ARCH_LIST=7.5
 ENV PYTHONUNBUFFERED=1
 

@@ -36,7 +36,7 @@ MODEL
 data
 datasets
 log
-logs
+logs/*
 log_mbrl
 log_mbrl_results/
 log_mbrl_cache/

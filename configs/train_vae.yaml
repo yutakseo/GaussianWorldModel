@@ -35,7 +35,7 @@ optimizer:
 # Dataloader settings
 dataloader:
   # num_workers: 8
-  num_workers: 32
+  num_workers: 0
   pin_memory: false
   prefetch_factor: 2
 

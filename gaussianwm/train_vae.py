@@ -46,7 +46,14 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
     if log_writer is not None:
         cprint(f'log_dir: {log_writer.log_dir}', 'green')
 
+    max_batches = len(data_loader)
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # DroidDataset is backed by an RLDS pipeline whose source repeats
+        # indefinitely.  __len__ defines the intended epoch boundary, so stop
+        # explicitly even if the underlying iterator keeps yielding samples.
+        if data_iter_step >= max_batches:
+            break
+
         obs = batch[0]
 
         image1 = obs

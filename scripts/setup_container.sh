@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 GWM_ROOT="${GWM_PATH:-/workspace}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-/usr/local/bin/python3}"
 CUDA_ARCH="${TORCH_CUDA_ARCH_LIST:-7.5}"
 SETUP_STATE_DIR="${GWM_SETUP_STATE_DIR:-/var/cache/gaussianwm}"
 SPLATT3R_CHECKPOINT="${SPLATT3R_CHECKPOINT:-${GWM_ROOT}/third_party/splatt3r/checkpoints/splatt3r_v1.0/epoch=19-step=1200.ckpt}"

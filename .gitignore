@@ -35,9 +35,8 @@ events.out.tfevents.*
 
 # Data and output directories
 MODEL
-data
-cache/
-log
+data/*
+cache
 logs/*
 log_mbrl
 log_mbrl_results/

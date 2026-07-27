@@ -37,22 +37,7 @@ cd third_party/splatt3r/checkpoints/splatt3r_v1.0
 wget https://huggingface.co/brandonsmart/splatt3r_v1.0/resolve/main/epoch%3D19-step%3D1200.ckpt
 cd ../../../../..
 ```
-
-## 🏞️ Pretraining
-
-See [docs/pretraining.md](docs/pretraining.md).
-
-Inside the configured container, no additional virtual environment is needed:
-
-```bash
-./scripts/train.sh all
-./scripts/infer.sh
-```
-
-Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`; no per-run time
-directory is created under `logs`.
-
-### Docker Compose
+## Docker Compose
 
 The container uses Python 3.10 with PyTorch 2.5.1 and CUDA 12.1. Its entrypoint
 installs the exact dependency versions from `uv.lock`, restores the recursive
@@ -85,6 +70,22 @@ TORCH_CUDA_ARCH_LIST='7.5;8.6' docker compose up --build -d
 
 The DROID dataset is stored directly at `data/droid_100`; no dataset symlink is
 created by container setup.
+
+
+## 🏞️ Pretraining
+
+See [docs/pretraining.md](docs/pretraining.md).
+
+Inside the configured container, no additional virtual environment is needed:
+
+```bash
+./scripts/train.sh all
+./scripts/infer.sh
+```
+
+Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`; no per-run time
+directory is created under `logs`.
+
 
 ## 🏷️ License
 

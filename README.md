@@ -83,8 +83,7 @@ Inside the configured container, no additional virtual environment is needed:
 ./scripts/infer.sh
 ```
 
-Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`; no per-run time
-directory is created under `logs`.
+Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`
 
 
 ## 🏷️ License

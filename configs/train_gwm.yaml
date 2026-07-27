@@ -38,6 +38,7 @@ train:
 # Evaluation settings
 eval:
   eval_every: 1000  # Evaluate every N steps
+  num_batches: 10   # Number of validation batches per evaluation
   num_rollout_batches: 10
   save_rollouts: true
   # rollout_horizon: ${dataset.segment_length} - ${dataset.context_length}
@@ -54,4 +55,4 @@ wandb:
 
 # Resume training
 resume: null  # Path to checkpoint to resume from 
-start_step: 0 
+start_step: 0

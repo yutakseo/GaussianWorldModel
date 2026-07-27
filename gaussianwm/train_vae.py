@@ -29,6 +29,40 @@ from processor.datasets import build_gaussian_splatting_reconstruction_dataset
 from util.distributed_utils import NativeScalerWithGradNormCount as NativeScaler
 
 
+class GaussianFeatureCache:
+    """Disk cache for post-Splatt3r, post-FPS point clouds."""
+
+    _DTYPES = {"float16": torch.float16, "float32": torch.float32}
+
+    def __init__(self, cache_dir, enabled, dtype, split="train"):
+        self.enabled = enabled
+        self.dtype = self._DTYPES[dtype]
+        self.cache_dir = Path(cache_dir) / split
+        if self.enabled:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, batch_index):
+        return self.cache_dir / f"batch_{batch_index:06d}.pt"
+
+    def load(self, batch_index):
+        if not self.enabled:
+            return None
+        path = self._path(batch_index)
+        if not path.is_file():
+            return None
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+    def save(self, batch_index, points):
+        if not self.enabled:
+            return
+        path = self._path(batch_index)
+        if path.is_file():
+            return
+        tmp_path = path.with_suffix(".tmp")
+        torch.save(points.detach().to(device="cpu", dtype=self.dtype).contiguous(), tmp_path)
+        os.replace(tmp_path, path)
+
+
 def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, loss_scaler,
                     max_norm=0, log_writer=None, cfg=None):
     model.train()
@@ -37,7 +71,12 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
     header = f'Epoch: [{epoch}]'
     print_freq = 20
 
-    splatt3r = Splatt3rRegressor().to(device)
+    splatt3r = None
+    cache = GaussianFeatureCache(
+        cfg.gaussian_cache.dir,
+        cfg.gaussian_cache.enabled,
+        cfg.gaussian_cache.dtype,
+    )
     accum_iter = cfg.train.accum_iter
     kl_weight = 1e-3
 
@@ -54,27 +93,28 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
         if data_iter_step >= max_batches:
             break
 
-        obs = batch[0]
+        points = cache.load(data_iter_step)
+        if points is None:
+            if splatt3r is None:
+                splatt3r = Splatt3rRegressor().to(device).eval()
 
-        image1 = obs
-        image1 = TensorUtils.to_device(TensorUtils.to_float(image1), device)
+            image1 = TensorUtils.to_device(TensorUtils.to_float(batch[0]), device)
+            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
+            with torch.no_grad(), torch.amp.autocast(
+                device_type=device.type, enabled=cfg.train.amp
+            ):
+                points, _ = splatt3r.forward_tensor(image1)
 
-        image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-
-        with torch.no_grad():
-            points, _ = splatt3r.forward_tensor(image1)
-
-        SH_C0 = 0.28209479177387814
-        colors = 0.5 + SH_C0 * points[..., -4:-1]
-        points[..., -4:-1] = colors / 255.0
-
-        points, _ = fps(points, K=cfg.model.point_cloud_size)
+            SH_C0 = 0.28209479177387814
+            points[..., -4:-1] = (0.5 + SH_C0 * points[..., -4:-1]) / 255.0
+            points, _ = fps(points.float(), K=cfg.model.point_cloud_size)
+            cache.save(data_iter_step, points)
         labels = points.clone()
 
         points = points.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             outputs = model(points, points)
 
             if 'kl' in outputs:
@@ -130,35 +170,40 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
 def evaluate(model, data_loader, device, cfg):
     model.eval()
     criterion = torch.nn.MSELoss()
-    splatt3r = Splatt3rRegressor().to(device)
+    splatt3r = None
+    cache = GaussianFeatureCache(
+        cfg.gaussian_cache.dir,
+        cfg.gaussian_cache.enabled,
+        cfg.gaussian_cache.dtype,
+        split="val",
+    )
 
     metric_logger = distributed_utils.MetricLogger(delimiter="  ")
     header = 'Eval:'
 
-    for batch in tqdm(metric_logger.log_every(data_loader, 50, header), desc="Evaluation"):
-        obs = batch[0]
+    for batch_index, batch in enumerate(
+        tqdm(metric_logger.log_every(data_loader, 50, header), desc="Evaluation")
+    ):
+        points = cache.load(batch_index)
+        if points is None:
+            if splatt3r is None:
+                splatt3r = Splatt3rRegressor().to(device).eval()
 
-        image1, image2 = obs['robot0_agentview_left_image'], obs['robot0_agentview_right_image']
-        image1 = TensorUtils.to_device(TensorUtils.to_float(image1), device)
-        image2 = TensorUtils.to_device(TensorUtils.to_float(image2), device)
+            image1 = TensorUtils.to_device(TensorUtils.to_float(batch[0]), device)
+            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
+            with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
+                points, _ = splatt3r.forward_tensor(image1)
 
-        image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-        image2 = einops.rearrange(image2, 'b t h w c -> (b t) c h w')
+            SH_C0 = 0.28209479177387814
+            points[..., -4:-1] = (0.5 + SH_C0 * points[..., -4:-1]) / 255.0
+            points, _ = fps(points.float(), K=cfg.model.point_cloud_size)
+            cache.save(batch_index, points)
 
-        with torch.no_grad():
-            points, _ = splatt3r.forward_tensor(image1)
-
-        SH_C0 = 0.28209479177387814
-        colors = 0.5 + SH_C0 * points[..., -4:-1]
-        points[..., -4:-1] = colors / 255.0
-
-        points, _ = fps(points, K=cfg.model.point_cloud_size)
         labels = points.clone()
-
         points = points.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             outputs = model(points, points)
 
             if 'kl' in outputs:
@@ -299,6 +344,15 @@ def main(cfg: DictConfig):
             cfg=cfg
         )
 
+        val_stats = None
+        if cfg.train.eval_every > 0 and (
+            epoch % cfg.train.eval_every == 0 or epoch + 1 == cfg.train.epochs
+        ):
+            val_stats = evaluate(model, data_loader_val, device, cfg)
+            if log_writer is not None:
+                for name, value in val_stats.items():
+                    log_writer.add_scalar(f'val/{name}', value, epoch)
+
         if cfg.output_dir and (epoch % 10 == 0 or epoch + 1 == cfg.train.epochs):
             distributed_utils.save_model(
                 args=cfg, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
@@ -306,6 +360,7 @@ def main(cfg: DictConfig):
 
         log_stats = {
             **{f'train_{k}': v for k, v in train_stats.items()},
+            **({f'val_{k}': v for k, v in val_stats.items()} if val_stats else {}),
             'epoch': epoch,
             'n_parameters': n_parameters
         }

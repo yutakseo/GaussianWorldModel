@@ -30,6 +30,7 @@ events.out.tfevents.*
 # IDE and editor files
 .vscode/
 .claude/
+.codex-persist/
 
 # Data and output directories
 MODEL

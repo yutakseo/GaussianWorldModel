@@ -22,6 +22,8 @@ n_views: 1  # Number of camera views to use
 # Data processing
 augment: false  # Temporarily disabled for compatibility
 val_ratio: 0.1
+load_all_data_for_training: false
+max_val_samples: null
 seed: ${seed}
 
 # Camera and action handling

@@ -124,7 +124,9 @@ class DroidDataset(IterableDataset):
         shuffle_buffer_size: int = 100000,
         batch_size: Optional[int] = None,
         traj_transform_threads: int = 48,
-        traj_read_threads: int = 48
+        traj_read_threads: int = 48,
+        load_all_data_for_training: bool = True,
+        max_val_samples: Optional[int] = None,
     ):
         """
         Initialize the DroidDataset using RLDS format.
@@ -223,6 +225,7 @@ class DroidDataset(IterableDataset):
             ),
             traj_transform_threads=traj_transform_threads,
             traj_read_threads=traj_read_threads,
+            load_all_data_for_training=load_all_data_for_training,
         )
 
         # Apply robomimic transform
@@ -238,7 +241,7 @@ class DroidDataset(IterableDataset):
             self.dataset_length = int(self.dataset_length)
         else:
             # The validation pipeline caches at most one shuffle buffer.
-            self.dataset_length = min(int(self.dataset_length), int(shuffle_buffer_size))
+            self.dataset_length = int(self.dataset_length) if max_val_samples is None else min(int(self.dataset_length), max_val_samples)
         self.dataset = self.dataset.take(self.dataset_length)
         
     def __iter__(self):
@@ -404,6 +407,8 @@ def build_gaussian_splatting_reconstruction_dataset(split, cfg):
             batch_size=None,
             traj_transform_threads=cfg.traj_transform_threads,
             traj_read_threads=cfg.traj_read_threads
+            ,load_all_data_for_training=cfg.get("load_all_data_for_training", True)
+            ,max_val_samples=cfg.get("max_val_samples", None)
         )
     else:
         raise ValueError(f"Dataset {cfg.dataset} not supported")

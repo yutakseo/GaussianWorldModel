@@ -97,6 +97,10 @@ class GaussianPredictor(nn.Module):
                 N=args.observation.point_cloud_size,
                 deterministic=not args.vae.use_kl
             ).to(device)
+            if args.vae.get("pretrained_path"):
+                checkpoint = torch.load(args.vae.pretrained_path, map_location="cpu")
+                self.vae.load_state_dict(checkpoint["model"])
+                self.vae.requires_grad_(False).eval()
             self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), lr=args.optimizer.tok_lr)
             cprint(f"[VAE] Trainable parameters: {sum(p.numel() for p in self.vae.parameters() if p.requires_grad)/1e6}M", 'yellow')
             cprint(f"[VAE] Total parameters: {sum(p.numel() for p in self.vae.parameters())/1e6}M", 'yellow')
@@ -176,6 +180,7 @@ class GaussianPredictor(nn.Module):
                 points, _ = self.splatt3r.forward_tensor(obs_flat)  # [B*T, N, 14]
 
             if self.args.vae.use_vae:   # Get latent representation
+                points, _ = fps(points.float(), K=self.args.observation.point_cloud_size)
                 enc = self.vae.encode(points)
                 if isinstance(enc, tuple):
                     enc = enc[0]  # [B, T, N, C]
@@ -192,6 +197,11 @@ class GaussianPredictor(nn.Module):
             embeddings = obs  # [B, T, C, H, W]
 
         return embeddings
+
+    @torch.no_grad()
+    def encode_observations(self, obs):
+        """Encode RGB sequences into frozen VAE latents for disk caching."""
+        return self._process_obs(obs).detach()
 
     def update(self, batch, update_tokenizer=True, update_model=True):
         start = time.time()
@@ -297,7 +307,14 @@ class GaussianPredictor(nn.Module):
             **grad_norms,
         }
 
-    def forward(self, batch, update_tokenizer=True, update_model=True):
+    def forward(
+        self,
+        batch,
+        update_tokenizer=True,
+        update_model=True,
+        precomputed_latents=False,
+        eval_mode=False,
+    ):
         start = time.time()
         metrics = {}
         total_loss = torch.tensor(0.0).to(self.device)
@@ -308,7 +325,9 @@ class GaussianPredictor(nn.Module):
         else:
             obs, action, reward, pad_mask = batch
             pad_mask = pad_mask.to(self.device)
-        obs = obs.to(self.device) / 255.    # [B, T, C, H, W]
+        obs = obs.to(self.device)
+        if not precomputed_latents:
+            obs = obs / 255.
         action = action.to(self.device)     # [B, T, A]
         reward = reward.to(self.device)     # [B, T]
         if self.args.symlog:
@@ -339,12 +358,12 @@ class GaussianPredictor(nn.Module):
 
         # Calculate model loss without optimization
         if update_model:
-            self.model.train()
+            self.model.train(not eval_mode)
             if self.args.reward.use_reward_model:
-                self.reward_model.train()
+                self.reward_model.train(not eval_mode)
             
             # Process observations to latent space
-            latent_embeddings = self._process_obs(obs)  # [B, T, D] or [B, T, C, H, W]
+            latent_embeddings = obs if precomputed_latents else self._process_obs(obs)
             
             # Forward through diffusion model
             diff_loss = self.model(
@@ -457,13 +476,26 @@ class GaussianPredictor(nn.Module):
 
         return torch.stack(obss, 1).float(), torch.stack(actions, 1).float(), torch.stack(rewards, 1).float()
 
-    def save_snapshot(self, workdir, suffix=''):
+    def save_snapshot(self, workdir, suffix='', optimizer=None, step=None):
         # Save unwrapped model if using DDP
         model_to_save = self.module if isinstance(self, DDP) else self
-        torch.save(model_to_save.model.state_dict(), os.path.join(workdir, f'model{suffix}.pt'))
+        checkpoint = {"model": model_to_save.model.state_dict()}
+        if optimizer is not None:
+            checkpoint["optimizer"] = optimizer.state_dict()
+        if step is not None:
+            checkpoint["step"] = step
+        torch.save(checkpoint, os.path.join(workdir, f'model{suffix}.pt'))
 
-    def load_snapshot(self, workdir, suffix=''):
+    def load_snapshot(self, workdir, suffix='', optimizer=None):
         # Load works for both DDP and single GPU
-        state_dict = torch.load(os.path.join(workdir, f'model{suffix}.pt'), 
-                              map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu')
+        checkpoint_path = os.path.join(workdir, f'model{suffix}.pt')
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu',
+        )
+        # Backward compatibility with checkpoints that contain only model weights.
+        state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
         self.model.load_state_dict(state_dict)
+        if optimizer is not None and "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        return checkpoint.get("step") if "model" in checkpoint else None

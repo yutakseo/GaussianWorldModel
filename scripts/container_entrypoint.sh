@@ -7,5 +7,34 @@ export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/thir
 
 "${GWM_ROOT}/scripts/setup_container.sh"
 
+if [[ "${CODEX_REMOTE_CONTROL:-1}" == "1" ]]; then
+    CODEX_BIN="$(command -v codex 2>/dev/null || true)"
+    if [[ -z "${CODEX_BIN}" && -x /root/.codex/packages/standalone/current/codex ]]; then
+        # The persisted managed CLI is available before editor integrations
+        # have had a chance to add `codex` to PATH in a fresh container.
+        CODEX_BIN=/root/.codex/packages/standalone/current/codex
+    fi
+
+    if [[ -n "${CODEX_BIN}" ]]; then
+        # PID and lock files refer to processes in the previous container and
+        # must not survive into the new PID namespace. Login and installation
+        # identity remain persisted elsewhere under /root/.codex.
+        rm -f \
+            /root/.codex/app-server-control/app-server-startup.lock \
+            /root/.codex/app-server-control/app-server-control.sock \
+            /root/.codex/app-server-daemon/app-server.pid \
+            /root/.codex/app-server-daemon/app-server.pid.lock \
+            /root/.codex/app-server-daemon/app-server-updater.pid \
+            /root/.codex/app-server-daemon/app-server-updater.pid.lock \
+            /root/.codex/app-server-daemon/daemon.lock
+
+        if ! timeout 30s "${CODEX_BIN}" remote-control start --json; then
+            echo "warning: Codex remote-control daemon failed to start" >&2
+        fi
+    else
+        echo "warning: Codex CLI is unavailable; remote control was not started" >&2
+    fi
+fi
+
 cd "${GWM_ROOT}"
 exec "$@"

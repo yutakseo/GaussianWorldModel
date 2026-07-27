@@ -24,8 +24,12 @@ services:
       UV_SYSTEM_PYTHON: "1"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CODEX_REMOTE_CONTROL: "${CODEX_REMOTE_CONTROL:-1}"
     volumes:
       - .:/workspace
+      # Keep Codex login, installation identity, and remote-control pairing
+      # across container removal/recreation. This directory is gitignored.
+      - ./.codex-persist:/root/.codex
       - gaussianwm-uv-cache:/root/.cache/uv
       - gaussianwm-torch-cache:/root/.cache/torch
       - gaussianwm-setup-state:/var/cache/gaussianwm

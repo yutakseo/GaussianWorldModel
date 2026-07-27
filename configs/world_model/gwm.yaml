@@ -19,7 +19,7 @@ model:
 # Gaussian Splat parameters
 observation:
   use_gs: false
-  point_cloud_size: 4096
+  point_cloud_size: 2048
 
 # 3D VAE parameters
 vae:
@@ -29,6 +29,7 @@ vae:
   vae_depth: 2  # renamed from num_res_blocks
   # use_kl: true
   use_kl: false
+  pretrained_path: logs/ae/checkpoint-99.pth
   commit_weight: 0.25
   # perceptual_weight: 0.1
 

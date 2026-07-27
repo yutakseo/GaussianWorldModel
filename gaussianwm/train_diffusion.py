@@ -60,6 +60,40 @@ def train_step(model, batch, optimizer, step, cfg):
     return metrics
 
 
+@torch.no_grad()
+def validate(model, val_loader, cfg):
+    """Evaluate a bounded number of validation batches and return mean metrics."""
+    metric_sums = {}
+    num_batches = 0
+
+    for batch in val_loader:
+        batch[0] = batch[0].permute(0, 1, 4, 2, 3).to(model.device)
+        _, metrics = model(
+            batch,
+            update_tokenizer=cfg.train.update_tokenizer,
+            update_model=cfg.train.update_model,
+            eval_mode=True,
+        )
+        for name, value in metrics.items():
+            metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
+        num_batches += 1
+        if num_batches >= cfg.eval.num_batches:
+            break
+
+    if num_batches == 0:
+        raise RuntimeError("Validation loader produced no batches")
+    return {name: value / num_batches for name, value in metric_sums.items()}
+
+
+def checkpoint_step_from_path(path):
+    """Extract a step from legacy names such as model_64424.pt."""
+    stem = Path(path).stem
+    try:
+        return int(stem.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 
 def log_metrics(metrics, step, logger, use_wandb=False):
     """Log metrics to console and wandb if enabled"""
@@ -126,20 +160,32 @@ def main(cfg: DictConfig):
         # drop_last=True
     )
     
-    start_step = 0
-    # if cfg.resume and os.path.exists(cfg.resume):
-    #     logger.info(f"Loading checkpoint from {cfg.resume}")
-    #     model.load_snapshot(cfg.resume)
-    #     # Extract step number if available in the checkpoint name
-    #     if '_' in os.path.basename(cfg.resume):
-    #         try:
-    #             checkpoint_step = os.path.basename(cfg.resume).split('_')[-1]
-    #             if checkpoint_step.endswith('.pt'):
-    #                 checkpoint_step = checkpoint_step[:-3]
-    #             start_step = int(checkpoint_step) + 1
-    #             logger.info(f"Resuming from step {start_step}")
-    #         except:
-    #             logger.info("Could not determine start step from checkpoint filename")
+    start_step = cfg.start_step
+    if cfg.resume:
+        resume_path = Path(cfg.resume).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        logger.info(f"Loading checkpoint from {resume_path}")
+        model_to_load = model.module if cfg.distributed.distributed else model
+        loaded_step = model_to_load.load_snapshot(
+            resume_path.parent,
+            suffix=resume_path.stem.removeprefix("model"),
+            optimizer=optimizer,
+        )
+        checkpoint_step = loaded_step
+        if checkpoint_step is None:
+            checkpoint_step = checkpoint_step_from_path(resume_path)
+            logger.warning(
+                "Legacy checkpoint has no optimizer state; AdamW will restart "
+                "with fresh momentum."
+            )
+        if checkpoint_step is None and start_step <= 0:
+            raise ValueError(
+                "Could not infer checkpoint step; set start_step explicitly."
+            )
+        if checkpoint_step is not None:
+            start_step = checkpoint_step + 1
+        logger.info(f"Resuming from step {start_step}")
     
     is_main_process = distributed_utils.is_main_process()
 
@@ -174,21 +220,42 @@ def main(cfg: DictConfig):
             if is_main_process:
                 log_metrics(metrics_final, step, logger, cfg.use_wandb)
                 print_rich_single_line_metrics(metrics)
+
+        if step % cfg.eval.eval_every == 0 and step > start_step:
+            with timer.context("validation"):
+                validation_metrics = validate(model, val_loader, cfg)
+            if is_main_process:
+                logger.info(
+                    "Validation at step %d: %s", step, validation_metrics
+                )
+                log_metrics(
+                    {f"validation/{k}": v for k, v in validation_metrics.items()},
+                    step,
+                    logger,
+                    cfg.use_wandb,
+                )
+                print_rich_single_line_metrics(
+                    {"validation": validation_metrics}
+                )
         
         if is_main_process and step % cfg.train.save_every == 0 and step > 0:
             logger.info(f"Saving model checkpoint at step {step}")
             # checkpoint_dir = work_dir / "checkpoints"
             checkpoint_dir = Path(cfg.output_dir) / "checkpoints"
-            checkpoint_dir.mkdir(exist_ok=True)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
             model_to_save = model.module if cfg.distributed.distributed else model
-            model_to_save.save_snapshot(checkpoint_dir, suffix=f"_{step}")
-            model_to_save.save_snapshot(checkpoint_dir, suffix="_latest")
+            model_to_save.save_snapshot(
+                checkpoint_dir, suffix=f"_{step}", optimizer=optimizer, step=step
+            )
+            model_to_save.save_snapshot(
+                checkpoint_dir, suffix="_latest", optimizer=optimizer, step=step
+            )
     
     logger.info("Saving final model")
     final_dir = checkpoint_dir / "final"
-    final_dir.mkdir(exist_ok=True)
+    final_dir.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if cfg.distributed.distributed else model
-    model_to_save.save_snapshot(final_dir)
+    model_to_save.save_snapshot(final_dir, optimizer=optimizer, step=step)
     
     logger.info("Training completed!")
 

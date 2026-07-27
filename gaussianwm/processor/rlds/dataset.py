@@ -239,14 +239,15 @@ def make_dataset_from_rlds(
         }
         if abs(sum(fractions.values()) - 1.0) > 1e-6:
             raise ValueError(f"Split fractions must sum to 1, got {fractions}")
-        train_end = round(fractions["train"] * 100)
+        trajectory_count = int(dataset_statistics["num_trajectories"])
+        train_end = round(fractions["train"] * trajectory_count)
         val_end = round(
-            (fractions["train"] + fractions["val"]) * 100
+            (fractions["train"] + fractions["val"]) * trajectory_count
         )
         split_specs = {
-            "train": f"train[:{train_end}%]",
-            "val": f"train[{train_end}%:{val_end}%]",
-            "test": f"train[{val_end}%:]",
+            "train": f"train[:{train_end}]",
+            "val": f"train[{train_end}:{val_end}]",
+            "test": f"train[{val_end}:{trajectory_count}]",
         }
         split = split_specs[data_split]
     elif "val" not in builder.info.splits:
@@ -604,8 +605,9 @@ def make_interleaved_dataset(
             data_split=data_split,
             split_fractions=split_fractions,
         )
+        trajectory_source = dataset.repeat() if train else dataset
         dataset = apply_trajectory_transforms(
-            dataset.repeat(),
+            trajectory_source,
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
@@ -618,8 +620,15 @@ def make_interleaved_dataset(
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 
-    # Interleave at the Frame/Trajectory Level
-    dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, sample_weights)
+    # Avoid TensorFlow's sampling combinator for a single dataset. In
+    # evaluation mode it may stop when the finite source reaches a shard
+    # boundary even though the transformed source was repeated.
+    if len(datasets) == 1:
+        dataset = datasets[0]
+    else:
+        dataset = dl.DLataset.sample_from_datasets(
+            datasets, sample_weights
+        )
 
     # If sampling by trajectory, flatten after interleaving to maintain trajectory integrity
     if sample_traj:

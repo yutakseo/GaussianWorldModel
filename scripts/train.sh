@@ -45,6 +45,10 @@ run_distributed() {
 }
 
 train_vae() {
+    local vae_overrides=()
+    if [[ -n "${VAE_RESUME:-}" ]]; then
+        vae_overrides+=("resume=${VAE_RESUME}")
+    fi
     echo "[GaussianWM] VAE weights -> ckpt/vae/${RUN_DATE}"
     echo "[GaussianWM] VAE log     -> logs/vae/${RUN_DATE}/${RUN_TIME}.log"
     run_distributed vae gaussianwm.train_vae \
@@ -53,6 +57,7 @@ train_vae() {
         "paths.date=${RUN_DATE}" \
         "paths.time=${RUN_TIME}" \
         use_wandb=false \
+        "${vae_overrides[@]}" \
         "${EXTRA_OVERRIDES[@]}"
 }
 

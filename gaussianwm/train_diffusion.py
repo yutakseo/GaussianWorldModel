@@ -94,6 +94,7 @@ def main(cfg: DictConfig):
     logger.info(OmegaConf.to_yaml(cfg))
 
     seed_everything(cfg.seed)
+    device = torch.device(cfg.device)
     
     if cfg.use_wandb and distributed_utils.is_main_process():
         import wandb

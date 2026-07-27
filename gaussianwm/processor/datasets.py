@@ -213,7 +213,11 @@ class DroidDataset(IterableDataset):
         self.dataset, self.dataset_length, self.dataset_statistics = make_interleaved_dataset(
             dataset_kwargs_list,
             sample_weights=[1.0],
-            train=(split == "train"),
+            # `data_split` selects disjoint trajectories. Keep the trajectory
+            # pipeline in training mode for every split so long episodes are
+            # chunked/subsampled consistently instead of collapsing held-out
+            # trajectories to a handful of windows.
+            train=True,
             shuffle_buffer_size=shuffle_buffer_size,
             batch_size=batch_size,
             balance_weights=False,

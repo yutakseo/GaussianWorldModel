@@ -17,7 +17,10 @@ shuffle_buffer_size: 10  # fast debug
 
 # Data processing
 augment: false  # Temporarily disabled for compatibility
-val_ratio: 0.1
+split_fractions:
+  train: 0.90
+  val: 0.05
+  test: 0.05
 load_all_data_for_training: false
 max_val_samples: null
 seed: ${seed}

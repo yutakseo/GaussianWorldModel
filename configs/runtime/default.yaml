@@ -44,9 +44,9 @@ hydra:
   run:
     dir: ${paths.log_dir}
   job_logging:
-    handlers:
-      file:
-        filename: ${paths.log_file}
+    root:
+      handlers:
+        - console
   sweep:
     dir: ${paths.log_root}/${paths.stage}/${paths.date}
     subdir: .

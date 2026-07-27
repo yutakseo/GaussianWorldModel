@@ -184,14 +184,14 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, cfg):
+def evaluate(model, data_loader, device, cfg, split="val"):
     model.eval()
     splatt3r = None
     cache = GaussianFeatureCache(
         cfg.gaussian_cache.dir,
         cfg.gaussian_cache.enabled,
         cfg.gaussian_cache.dtype,
-        split="val",
+        split=split,
     )
 
     metric_logger = distributed_utils.MetricLogger(delimiter="  ")
@@ -262,9 +262,13 @@ def main(cfg: DictConfig):
 
     dataset_train = build_gaussian_splatting_reconstruction_dataset('train', cfg=cfg.dataset)
     dataset_val = build_gaussian_splatting_reconstruction_dataset('val', cfg=cfg.dataset)
+    dataset_test = build_gaussian_splatting_reconstruction_dataset(
+        "test", cfg=cfg.dataset
+    )
 
     logger.info(f'Train dataset size: {len(dataset_train)}')
     logger.info(f'Val dataset size: {len(dataset_val)}')
+    logger.info(f'Test dataset size: {len(dataset_test)}')
 
     is_main_process = distributed_utils.is_main_process()
 
@@ -283,7 +287,12 @@ def main(cfg: DictConfig):
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val,
-        batch_size=1,
+        batch_size=cfg.train.batch_size,
+        num_workers=cfg.dataloader.num_workers,
+    )
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=cfg.train.batch_size,
         num_workers=cfg.dataloader.num_workers,
     )
     model = create_autoencoder(
@@ -328,8 +337,14 @@ def main(cfg: DictConfig):
     distributed_utils.load_model(args=cfg, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if cfg.eval_only:
-        test_stats = evaluate(model, data_loader_val, device, cfg)
-        logger.info(f"Eval loss on {len(dataset_val)} test samples: {test_stats['loss']:.6f}")
+        test_stats = evaluate(
+            model, data_loader_test, device, cfg, split="test"
+        )
+        logger.info(
+            "Eval loss on %d test samples: %.6f",
+            len(dataset_test),
+            test_stats["loss"],
+        )
         return
 
     logger.info(f"Starting training for {cfg.train.epochs} epochs")
@@ -376,6 +391,10 @@ def main(cfg: DictConfig):
             wandb.log(log_stats)
 
     total_time = time.time() - start_time
+    test_stats = evaluate(
+        model, data_loader_test, device, cfg, split="test"
+    )
+    logger.info("Final test metrics: %s", test_stats)
     logger.info(f'Training time: {total_time / 3600:.2f} hours')
 
 if __name__ == '__main__':

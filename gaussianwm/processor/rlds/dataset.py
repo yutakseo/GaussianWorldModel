@@ -49,6 +49,8 @@ def make_dataset_from_rlds(
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
     load_all_data_for_training: bool = True,
+    data_split: Optional[str] = None,
+    split_fractions: Optional[Dict[str, float]] = None,
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
@@ -227,11 +229,31 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
 
     # construct the dataset
-    if "val" not in builder.info.splits:
+    if data_split is not None:
+        if data_split not in {"train", "val", "test"}:
+            raise ValueError(f"Unknown data split: {data_split}")
+        fractions = split_fractions or {
+            "train": 0.9,
+            "val": 0.05,
+            "test": 0.05,
+        }
+        if abs(sum(fractions.values()) - 1.0) > 1e-6:
+            raise ValueError(f"Split fractions must sum to 1, got {fractions}")
+        train_end = round(fractions["train"] * 100)
+        val_end = round(
+            (fractions["train"] + fractions["val"]) * 100
+        )
+        split_specs = {
+            "train": f"train[:{train_end}%]",
+            "val": f"train[{train_end}%:{val_end}%]",
+            "test": f"train[{val_end}%:]",
+        }
+        split = split_specs[data_split]
+    elif "val" not in builder.info.splits:
         split = "train[:95%]" if train else "train[95%:]"
     else:
         split = "train" if train else "val"
-    if load_all_data_for_training and train:
+    if data_split is None and load_all_data_for_training and train:
         split = "train"
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
@@ -468,6 +490,8 @@ def make_interleaved_dataset(
     traj_read_threads: Optional[int] = None,
     load_all_data_for_training: bool = True,
     sample_traj: bool = False,
+    data_split: Optional[str] = None,
+    split_fractions: Optional[Dict[str, float]] = None,
 ) -> dl.DLataset:
     """
     Creates an interleaved dataset from list of dataset configs (kwargs). Returns a dataset of batched frames.
@@ -512,10 +536,23 @@ def make_interleaved_dataset(
         if "dataset_frame_transform_kwargs" in data_kwargs:
             data_kwargs.pop("dataset_frame_transform_kwargs")
         _, dataset_statistics = make_dataset_from_rlds(
-            **data_kwargs, train=train, load_all_data_for_training=load_all_data_for_training
+            **data_kwargs,
+            train=train,
+            load_all_data_for_training=load_all_data_for_training,
+            data_split=data_split,
+            split_fractions=split_fractions,
         )
-        dataset_sizes.append(dataset_statistics["num_transitions"])
-        traj_sizes.append(dataset_statistics["num_trajectories"])
+        split_fraction = (
+            split_fractions[data_split]
+            if data_split is not None and split_fractions is not None
+            else 1.0
+        )
+        dataset_sizes.append(
+            max(1, round(dataset_statistics["num_transitions"] * split_fraction))
+        )
+        traj_sizes.append(
+            max(1, round(dataset_statistics["num_trajectories"] * split_fraction))
+        )
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
     # Get the indices of the "primary" datasets (i.e., datasets with sample_weight == 1.0)
@@ -564,6 +601,8 @@ def make_interleaved_dataset(
             num_parallel_reads=reads,
             dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
             load_all_data_for_training=load_all_data_for_training,
+            data_split=data_split,
+            split_fractions=split_fractions,
         )
         dataset = apply_trajectory_transforms(
             dataset.repeat(),

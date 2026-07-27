@@ -32,18 +32,22 @@ GPU_COUNT="${#GPU_LIST[@]}"
 EXTRA_OVERRIDES=("$@")
 
 run_distributed() {
-    local entrypoint="$1"
-    shift
+    local stage="$1"
+    local entrypoint="$2"
+    shift 2
+    local log_dir="logs/${stage}/${RUN_DATE}"
+    local log_file="${log_dir}/${RUN_TIME}.log"
+    mkdir -p "${log_dir}"
     CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_BIN}" -m torch.distributed.run \
         --nproc_per_node="${GPU_COUNT}" \
         --master_port="${MASTER_PORT}" \
-        --module "${entrypoint}" "$@"
+        --module "${entrypoint}" "$@" 2>&1 | tee -a "${log_file}"
 }
 
 train_vae() {
     echo "[GaussianWM] VAE weights -> ckpt/vae/${RUN_DATE}"
     echo "[GaussianWM] VAE log     -> logs/vae/${RUN_DATE}/${RUN_TIME}.log"
-    run_distributed gaussianwm.train_vae \
+    run_distributed vae gaussianwm.train_vae \
         --config-name train_vae \
         dataset=droid \
         "paths.date=${RUN_DATE}" \
@@ -62,7 +66,7 @@ train_dit() {
 
     echo "[GaussianWM] DiT weights -> ckpt/dit/${RUN_DATE}"
     echo "[GaussianWM] DiT log     -> logs/dit/${RUN_DATE}/${RUN_TIME}.log"
-    run_distributed gaussianwm.train_diffusion \
+    run_distributed dit gaussianwm.train_diffusion \
         --config-name train_gwm \
         dataset=droid \
         "paths.date=${RUN_DATE}" \

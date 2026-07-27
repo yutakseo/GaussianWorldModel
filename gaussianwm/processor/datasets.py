@@ -117,7 +117,6 @@ class DroidDataset(IterableDataset):
         action_dim: int = 10,
         image_size: int = 128,
         augment: bool = False,
-        val_ratio: float = 0.0,
         seed: int = 42,
         split: str = "train",
         camera_keys: List[str] = ["primary", "secondary"],
@@ -130,6 +129,7 @@ class DroidDataset(IterableDataset):
         traj_read_threads: int = 48,
         load_all_data_for_training: bool = True,
         max_val_samples: Optional[int] = None,
+        split_fractions: Optional[Dict[str, float]] = None,
     ):
         """
         Initialize the DroidDataset using RLDS format.
@@ -141,7 +141,6 @@ class DroidDataset(IterableDataset):
             action_dim: Dimension of action vectors (10 for DROID)
             image_size: Size to resize images to (H=W=image_size)
             augment: Whether to use data augmentation
-            val_ratio: Fraction of data to use for validation
             seed: Random seed for reproducibility
             split: 'train' or 'val'
             camera_keys: Camera observation keys
@@ -165,6 +164,15 @@ class DroidDataset(IterableDataset):
         self.camera_keys = camera_keys
         self.action_keys = action_keys
         self.rng = np.random.RandomState(seed)
+        self.split_fractions = split_fractions or {
+            "train": 0.9,
+            "val": 0.05,
+            "test": 0.05,
+        }
+        if split not in self.split_fractions:
+            raise ValueError(
+                f"Split must be one of {tuple(self.split_fractions)}, got {split}"
+            )
 
         # Base dataset configuration
         BASE_DATASET_KWARGS = {
@@ -229,6 +237,8 @@ class DroidDataset(IterableDataset):
             traj_transform_threads=traj_transform_threads,
             traj_read_threads=traj_read_threads,
             load_all_data_for_training=load_all_data_for_training,
+            data_split=split,
+            split_fractions=self.split_fractions,
         )
 
         # Apply robomimic transform
@@ -240,11 +250,11 @@ class DroidDataset(IterableDataset):
         # Without this cap a VAE epoch never finishes, checkpointing is never
         # reached, and DataLoader warns once more than dataset_length samples
         # have been yielded.
-        if split == "train":
-            self.dataset_length = int(self.dataset_length)
-        else:
-            # The validation pipeline caches at most one shuffle buffer.
-            self.dataset_length = int(self.dataset_length) if max_val_samples is None else min(int(self.dataset_length), max_val_samples)
+        self.dataset_length = int(self.dataset_length)
+        if split != "train" and max_val_samples is not None:
+            self.dataset_length = min(
+                self.dataset_length, max_val_samples
+            )
         self.dataset = self.dataset.take(self.dataset_length)
         
     def __iter__(self):
@@ -399,7 +409,6 @@ def build_gaussian_splatting_reconstruction_dataset(split, cfg):
             action_dim=cfg.action_dim,
             image_size=cfg.image_size,
             augment=cfg.augment,
-            val_ratio=cfg.val_ratio,
             seed=cfg.seed,
             split=split,
             camera_keys=cfg.camera_keys,
@@ -414,6 +423,7 @@ def build_gaussian_splatting_reconstruction_dataset(split, cfg):
                 "load_all_data_for_training", True
             ),
             max_val_samples=cfg.get("max_val_samples", None),
+            split_fractions=dict(cfg.split_fractions),
         )
     else:
         raise ValueError(f"Dataset {cfg.dataset} not supported")

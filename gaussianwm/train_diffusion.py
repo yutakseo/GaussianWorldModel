@@ -110,9 +110,13 @@ def main(cfg: DictConfig):
 
     train_dataset = build_gaussian_splatting_reconstruction_dataset("train", cfg.dataset)
     val_dataset = build_gaussian_splatting_reconstruction_dataset("val", cfg.dataset)
+    test_dataset = build_gaussian_splatting_reconstruction_dataset(
+        "test", cfg.dataset
+    )
     
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
+    logger.info(f"Test dataset size: {len(test_dataset)}")
     
     train_loader = make_data_loader(
         train_dataset,
@@ -122,6 +126,12 @@ def main(cfg: DictConfig):
     )
     val_loader = make_data_loader(
         val_dataset,
+        batch_size=cfg.world_model.batch_size,
+        num_workers=cfg.dataloader.num_workers,
+        pin_memory=cfg.dataloader.pin_memory,
+    )
+    test_loader = make_data_loader(
+        test_dataset,
         batch_size=cfg.world_model.batch_size,
         num_workers=cfg.dataloader.num_workers,
         pin_memory=cfg.dataloader.pin_memory,
@@ -226,6 +236,9 @@ def main(cfg: DictConfig):
         unwrap_model(model).save_snapshot(
             final_dir, optimizer=optimizer, step=step
         )
+    test_metrics = validate(model, test_loader, cfg)
+    if is_main_process:
+        logger.info("Final test metrics: %s", test_metrics)
     
     logger.info("Training completed!")
 

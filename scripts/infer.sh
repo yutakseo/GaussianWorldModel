@@ -36,6 +36,7 @@ echo "[GaussianWM] Checkpoint: ${CHECKPOINT}"
 echo "[GaussianWM] Output:     ${OUTPUT_DIR}"
 echo "[GaussianWM] Log:        logs/infer/${RUN_DATE}/${RUN_TIME}.log"
 
+mkdir -p "logs/infer/${RUN_DATE}"
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_BIN}" -m gaussianwm.demo \
     --config-name train_gwm \
     dataset=droid \
@@ -49,4 +50,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_BIN}" -m gaussianwm.demo \
     world_model.vae.use_vae=true \
     world_model.observation.use_gs=true \
     world_model.reward.use_reward_model=false \
-    use_wandb=false
+    use_wandb=false 2>&1 | tee -a "logs/infer/${RUN_DATE}/${RUN_TIME}.log"

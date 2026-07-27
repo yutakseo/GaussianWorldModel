@@ -1,5 +1,6 @@
 ## Project-specific
-ckpt/
+ckpt/*
+logs/*
 checkpoints/
 runs/
 tensorboard/
@@ -35,19 +36,19 @@ events.out.tfevents.*
 # Data and output directories
 MODEL
 data
-datasets
+cache/
 log
 logs/*
 log_mbrl
 log_mbrl_results/
 log_mbrl_cache/
 output
-outputs
+outputs/*
 output_frames/
 third_party
 test/
 
-## 
+##
 wandb
 **/.DS_Store
 *.lprof

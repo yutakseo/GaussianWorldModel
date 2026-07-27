@@ -23,32 +23,21 @@ observation:
 
 # 3D VAE parameters
 vae:
-  use_vae: false
-  num_latents: 16384
-  latent_dim: 256
-  vae_depth: 2  # renamed from num_res_blocks
-  # use_kl: true
+  # This public DiT uses a square 2D latent grid. Use the trained 8x8 VAE.
+  use_vae: true
+  num_latents: 64
+  latent_dim: 64
+  vae_depth: 4
   use_kl: false
-  pretrained_path: logs/ae/checkpoint-99.pth
-  commit_weight: 0.25
-  # perceptual_weight: 0.1
+  pretrained_path: ${paths.checkpoint_root}/vae/${paths.date}/checkpoint-99.pth
 
 # Reward model parameters
 reward:
   use_reward_model: true
   reward_weight: 1.0
 
-# Training parameters
-# training:
 symlog: true
-# batch_size: 16  # slow 2x?
-# batch_size: 8
 batch_size: 4
-selected_params: true
-# segment_length: 12
-# context_length: 2
-# segment_length: 2
-# context_length: 1
 segment_length: ${dataset.segment_length}
 context_length: ${dataset.context_length}
 action_dim: ${dataset.action_dim}
@@ -56,9 +45,14 @@ action_dim: ${dataset.action_dim}
 # Diffusion parameters
 diffusion:
   sigma_data: 0.5
-  sigma_offset_noise: 0.1
+  # Standard EDM perturbation from the paper; no channel-wise offset noise.
+  sigma_offset_noise: 0.0
   noise_previous_obs: false
-  sigma_loc: -1.2
+  # Start with teacher forcing. Enable only for a later rollout fine-tuning
+  # stage after stable one-step prediction has been established.
+  autoregressive_training: false
+  # Paper Appendix B.1 uses P_mean=-0.4 and P_std=1.2.
+  sigma_loc: -0.4
   sigma_scale: 1.2
   sigma_min: 2e-3
   sigma_max: 20.0
@@ -68,29 +62,6 @@ diffusion:
 
 # Optimizer parameters
 optimizer:
-  # VAE/Tokenizer optimizer
-  tok_lr: 1e-4
-  tok_wd: 0.0
-  tok_beta1: 0.9
-  tok_beta2: 0.999
-  
-  # Model optimizer
   model_lr: 1e-4
-  model_wd: 0.0
-  embed_no_wd: false
   max_grad_norm: 10.0
-  
-  # Reward model optimizer
   reward_model_lr: 1e-4
-  reward_model_wd: 0.0
-
-# Sampling parameters for inference
-sampling:
-  s_churn: 0.0  # amount of stochasticity
-  s_tmin: 0.0
-  s_tmax: 5.0
-  s_noise: 1.0
-  s_cond: 0.005
-
-# Optional paths for pretrained models
-pretrained_model_path: null

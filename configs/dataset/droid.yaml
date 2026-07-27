@@ -15,10 +15,6 @@ image_size: 128  # Matches crop size in config
 # shuffle_buffer_size: 100_000
 shuffle_buffer_size: 10  # fast debug
 
-# Point cloud parameters (for Gaussian Splatting)
-point_cloud_size: 4096
-n_views: 1  # Number of camera views to use
-
 # Data processing
 augment: false  # Temporarily disabled for compatibility
 val_ratio: 0.1
@@ -29,7 +25,6 @@ seed: ${seed}
 # Camera and action handling
 camera_keys: ["primary", "secondary"]  # Using primary and secondary cameras
 action_keys: ["actions"]
-dummy_action: false
 
 # DROID-specific RLDS parameters
 future_action_window_size: 15
@@ -37,7 +32,3 @@ subsample_length: 100
 batch_size: null
 traj_transform_threads: 48
 traj_read_threads: 48
-
-# Episode structure
-max_episode_length: 500  # Matches horizon from config
-min_episode_length: ${dataset.segment_length}

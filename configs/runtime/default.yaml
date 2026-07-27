@@ -1,0 +1,52 @@
+# @package _global_
+
+seed: 42
+device: cuda
+
+paths:
+  stage: ???
+  date: ${now:%Y-%m-%d}
+  time: ${now:%H-%M-%S}
+  checkpoint_root: ckpt
+  log_root: logs
+  output_root: outputs
+  cache_root: cache
+  checkpoint_dir: ${paths.checkpoint_root}/${paths.stage}/${paths.date}
+  log_dir: ${paths.log_root}/${paths.stage}/${paths.date}
+  log_file: ${paths.log_dir}/${paths.time}.log
+  metrics_file: ${paths.log_dir}/${paths.time}.metrics.jsonl
+  inference_dir: ${paths.output_root}/${paths.date}/${paths.time}
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+
+distributed:
+  rank: null
+  gpu: null
+  distributed: false
+  world_size: 1
+  local_rank: -1
+  dist_on_itp: false
+  dist_backend: nccl
+  dist_url: env://
+  dist_eval: false
+
+use_wandb: false
+wandb:
+  project: gaussianwm
+  name: null
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
+  run:
+    dir: ${paths.log_dir}
+  job_logging:
+    handlers:
+      file:
+        filename: ${paths.log_file}
+  sweep:
+    dir: ${paths.log_root}/${paths.stage}/${paths.date}
+    subdir: .

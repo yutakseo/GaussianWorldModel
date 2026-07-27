@@ -1,58 +1,35 @@
 # @package _global_
 defaults:
-  - _self_
+  - runtime: default
   - world_model: gwm
   - dataset: droid
+  - _self_
 
-# General settings
-seed: 42
-device: cuda
-
-# Dataloader settings
-dataloader:
-  # num_workers: 4
-  num_workers: 0
-  pin_memory: false
-
-# Distributed training settings
-distributed:
-  rank: null
-  gpu: null
-  distributed: false
-  world_size: 1
-  local_rank: -1
-  dist_on_itp: false
-  dist_backend: nccl
-  dist_url: env://
-  dist_eval: false
+paths:
+  stage: dit
 
 # Training settings
 train:
   max_steps: 1000000  # Total number of training steps
   log_every: 10    # Log metrics every N steps
   save_every: 10000  # Save checkpoint every N steps
-  update_tokenizer: true
+  # The pretrained Gaussian VAE remains frozen during dynamics training.
+  update_tokenizer: false
   update_model: true
-  batch_accumulation: 1
 
 # Evaluation settings
 eval:
   eval_every: 1000  # Evaluate every N steps
   num_batches: 10   # Number of validation batches per evaluation
-  num_rollout_batches: 10
-  save_rollouts: true
-  # rollout_horizon: ${dataset.segment_length} - ${dataset.context_length}
-  rollout_horizon: 8
-  save_max_samples: 1
 
-# Logging and checkpointing
-output_dir: logs/gwm
-log_dir: logs/gwm
-use_wandb: false
-wandb:
-  project: gaussianwm
-  name: null  # Auto-generated if not specified
+# Qualitative rollout settings used by gaussianwm/demo.py.
+demo:
+  num_samples: 5
+  output_dir: ${paths.inference_dir}
+
+# Checkpoints contain weights only. Hydra writes process logs under paths.log_dir.
+checkpoint_dir: ${paths.checkpoint_dir}
 
 # Resume training
-resume: null  # Path to checkpoint to resume from 
+resume: null  # Path to checkpoint to resume from
 start_step: 0

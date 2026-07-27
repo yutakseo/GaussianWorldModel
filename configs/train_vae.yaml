@@ -1,17 +1,14 @@
 # @package _global_
 defaults:
+  - runtime: default
   - dataset: droid
   - vae: transformer
   - _self_
 
-# General settings
+# VAE uses its own seed while sharing runtime/device/distributed settings.
 seed: 0
-device: cuda
-
-# Model settings
-model:
-  name: ae_d64_m64
-  point_cloud_size: 2048
+paths:
+  stage: vae
 
 # Training settings
 train:
@@ -27,7 +24,8 @@ train:
 # epochs reuse these point clouds instead of recomputing them.
 gaussian_cache:
   enabled: true
-  dir: ${output_dir}/gaussian_cache
+  # v2 uses correct Splatt3r image normalization and raw SH coefficients.
+  dir: ${paths.cache_root}/vae/${paths.date}/gaussian_features
   dtype: float16  # Set to float32 for an exact, larger cache.
 
 # Optimizer settings
@@ -41,39 +39,13 @@ optimizer:
   layer_decay: 0.75
   min_lr: 1e-6
 
-# Dataloader settings
-dataloader:
-  # num_workers: 8
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: 2
-
-# Distributed training settings
-distributed:
-  rank: null
-  gpu: null
-  distributed: false
-  world_size: 1
-  local_rank: -1
-  dist_on_itp: false
-  dist_backend: nccl
-  dist_url: env://
-  dist_eval: false
-
-# Logging and output
-output_dir: logs/ae/
-log_dir: logs/ae/
-use_wandb: false
+# Weights and logs are intentionally separate.
+checkpoint_dir: ${paths.checkpoint_dir}
+log_dir: ${paths.log_dir}
 wandb:
-  project: gaussianwm
-  name: ${model.name}
+  name: ${vae.name}
 
 # Resume training
 resume: null  # Path to checkpoint to resume from
 start_epoch: 0
 eval_only: false  # Set to true for evaluation only
-
-# CUDA settings
-cuda_visible_devices: 3
-master_port: 12345
-nproc_per_node: 1

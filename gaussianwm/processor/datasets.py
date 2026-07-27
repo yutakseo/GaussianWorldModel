@@ -67,7 +67,10 @@ def robomimic_transform(trajectory):
             "robot_state/gripper_position": trajectory["observation"]["proprio"][..., -1:],
             "pad_mask": trajectory["observation"]["pad_mask"][..., None],
         },
-        "actions": trajectory["action"][1:],
+        # Keep action[t] aligned with observation[t]. The denoiser uses
+        # action[t] to predict observation[t + 1]. Dropping the first action
+        # here shifted every transition by one step.
+        "actions": trajectory["action"],
     }
 
 
@@ -253,18 +256,19 @@ class DroidDataset(IterableDataset):
             # print(f"{sample['obs'].keys()=}")
             # dict_keys(['camera/image/varied_camera_1_left_image', 'camera/image/varied_camera_2_left_image', \
             # 'raw_language', 'robot_state/cartesian_position', 'robot_state/gripper_position', 'pad_mask'])
-            obs = {}
-            # pad_mask = torch.from_numpy(sample['obs']['pad_mask']).to(torch.bool)
-
             left_frames = sample['obs']['camera/image/varied_camera_1_left_image']  # Use primary camera
             right_frames = sample['obs']['camera/image/varied_camera_2_left_image']
-            action = sample['actions']
+            # Only the actions aligned with the observation window are used;
+            # the RLDS chunk may also contain a future-action horizon.
+            action = sample['actions'][:self.segment_length]
+            pad_mask = sample['obs']['pad_mask']
             reward = torch.zeros((self.segment_length, 1))  # Dummy reward
             
             # Convert numpy arrays to torch tensors
             left_frames = torch.from_numpy(left_frames)
             right_frames = torch.from_numpy(right_frames)
             action = torch.from_numpy(action)
+            pad_mask = torch.from_numpy(pad_mask).to(torch.bool).squeeze(-1)
 
             # print(f"{left_frames.shape=}, {left_frames.dtype=}, {left_frames.min()=}, {left_frames.max()=}")
             # left_frames.shape=torch.Size([2, 128, 128, 3]), 
@@ -282,8 +286,7 @@ class DroidDataset(IterableDataset):
             #     "robot0_agentview_right_image": right_frames,
             # }
             obs = left_frames
-            # yield obs, action, reward, pad_mask
-            yield obs, action, reward
+            yield obs, action, reward, pad_mask
 
     def __len__(self):
         # lengths = np.array(
@@ -406,9 +409,11 @@ def build_gaussian_splatting_reconstruction_dataset(split, cfg):
             shuffle_buffer_size=cfg.shuffle_buffer_size,
             batch_size=None,
             traj_transform_threads=cfg.traj_transform_threads,
-            traj_read_threads=cfg.traj_read_threads
-            ,load_all_data_for_training=cfg.get("load_all_data_for_training", True)
-            ,max_val_samples=cfg.get("max_val_samples", None)
+            traj_read_threads=cfg.traj_read_threads,
+            load_all_data_for_training=cfg.get(
+                "load_all_data_for_training", True
+            ),
+            max_val_samples=cfg.get("max_val_samples", None),
         )
     else:
         raise ValueError(f"Dataset {cfg.dataset} not supported")

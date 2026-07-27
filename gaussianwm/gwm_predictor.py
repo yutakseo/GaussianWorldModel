@@ -1,34 +1,20 @@
 import os
-import sys
 import math
-
-# Add the project root directory to Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
 
 import time
-import numpy as np
-from tqdm import tqdm
-import cv2
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from accelerate.utils import set_seed
-
-from safetensors.torch import load_file
-# from accelerate import Accelerator
-from gaussianwm.vq_model import LPIPS
 
 from gaussianwm.diffusion.denoiser import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from gaussianwm.diffusion.diffusion_sampler import DiffusionSampler, DiffusionSamplerConfig
-from gaussianwm.diffusion.models import DiT_models, InnerModelConfig
+from gaussianwm.diffusion.models import InnerModelConfig
 from gaussianwm.reward.reward_model import RewardModel, RewardModelConfig
-from dotmap import DotMap
 from termcolor import cprint
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pytorch3d.ops import sample_farthest_points as fps
-import einops
 
 
 def symlog(x):
@@ -66,6 +52,12 @@ class GaussianPredictor(nn.Module):
             sigma_data=args.diffusion.sigma_data,
             sigma_offset_noise=args.diffusion.sigma_offset_noise,
             noise_previous_obs=args.diffusion.noise_previous_obs,
+            # Gaussian parameters are continuous physical values. Applying
+            # the legacy RGB clamp/8-bit quantization destroys them.
+            quantize_output=not args.observation.use_gs,
+            autoregressive_training=args.diffusion.get(
+                "autoregressive_training", False
+            ),
         )
         reward_model_config = RewardModelConfig(
                 lstm_dim=args.model.hidden_size,
@@ -98,10 +90,16 @@ class GaussianPredictor(nn.Module):
                 deterministic=not args.vae.use_kl
             ).to(device)
             if args.vae.get("pretrained_path"):
+                if not os.path.isfile(args.vae.pretrained_path):
+                    raise FileNotFoundError(
+                        "Gaussian VAE checkpoint not found: "
+                        f"{args.vae.pretrained_path}. Train it first with "
+                        "`bash scripts/pretrain/vae.sh`; do not reuse a raw-"
+                        "Gaussian DiT checkpoint with the latent DiT."
+                    )
                 checkpoint = torch.load(args.vae.pretrained_path, map_location="cpu")
                 self.vae.load_state_dict(checkpoint["model"])
                 self.vae.requires_grad_(False).eval()
-            self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), lr=args.optimizer.tok_lr)
             cprint(f"[VAE] Trainable parameters: {sum(p.numel() for p in self.vae.parameters() if p.requires_grad)/1e6}M", 'yellow')
             cprint(f"[VAE] Total parameters: {sum(p.numel() for p in self.vae.parameters())/1e6}M", 'yellow')
 
@@ -117,7 +115,12 @@ class GaussianPredictor(nn.Module):
             
             # Pre-compute spatial dimensions for reshaping when using VAE
             self.nh = int(math.sqrt(args.vae.num_latents))
-            self.nw = self.nh  # Assuming square spatial dimensions
+            self.nw = self.nh
+            if self.nh * self.nw != args.vae.num_latents:
+                raise ValueError(
+                    "The public 2D DiT requires a square number of VAE "
+                    f"latents, got {args.vae.num_latents}."
+                )
             # Update input_size to spatial dimensions
             denoiser_config.inner_model.input_size = self.nh
 
@@ -146,21 +149,7 @@ class GaussianPredictor(nn.Module):
         )
         self.diffusion_sampler = DiffusionSampler(self.model, sampler_config)
 
-        # prepare for tokenizer training
-        self.lpips = LPIPS().to(device).eval()
-        # if args.selected_params:
-        #     params = [parameter for name, parameter in self.tokenizer.named_parameters() if 'quantize' not in name]
-        # else:
-        #     params = list(self.tokenizer.parameters())
-        # self.tok_optimizer = torch.optim.AdamW(
-        #     params,
-        #     lr=args.optimizer.tok_lr,
-        #     betas=(args.optimizer.tok_beta1, args.optimizer.tok_beta2),
-        #     weight_decay=args.optimizer.tok_wd,
-        #     eps=1e-8,
-        # )
-
-        # prepare for model training
+        # Prepare the latent dynamics optimizer. The pretrained VAE is frozen.
         self.model_optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.optimizer.model_lr)
 
         if args.reward.use_reward_model:
@@ -203,110 +192,6 @@ class GaussianPredictor(nn.Module):
         """Encode RGB sequences into frozen VAE latents for disk caching."""
         return self._process_obs(obs).detach()
 
-    def update(self, batch, update_tokenizer=True, update_model=True):
-        start = time.time()
-        metrics = {}
-        if len(batch) == 3:
-            obs, action, reward = batch
-            pad_mask = None
-        else:
-            obs, action, reward, pad_mask = batch
-            pad_mask = pad_mask.to(self.device)
-        obs = obs.to(self.device) / 255.    # [B, T, C, H, W]
-        action = action.to(self.device)     # [B, T, A]
-        reward = reward.to(self.device)     # [B, T]
-        if self.args.symlog:
-            reward = symlog(reward)
-
-        if update_tokenizer and self.args.vae.use_vae:
-            metrics.update(self.update_vae(self.args, obs))
-        if update_model:
-            metrics.update(self.update_model(self.args, obs, action, reward, pad_mask))
-        metrics.update({'model_update_time': time.time() - start})
-        return metrics
-
-    def update_vae(self, args, obs):
-        """Updated VAE training with Gaussian features"""
-        self.vae_optimizer.zero_grad()
-        
-        B, T, C, H, W = obs.shape
-        obs_flat = obs.reshape(B*T, C, H, W)
-        
-        # Get Gaussian features from Splatt3r
-        with torch.no_grad():
-            points, _ = self.splatt3r.forward_tensor(obs_flat) # e.g., [160, 4096, 14]
-            # points = torch.cat([points_1, points_2], dim=1)
-
-        # VAE reconstruction
-        # z, _, commit_loss = self.vae.encode(points)
-        z = self.vae.encode(points) # e.g., [160, 512, 256]
-        recon = self.vae.decode(z) #queries=points)
-        
-        # Reconstruction loss on Gaussian parameters
-        recon_loss = F.mse_loss(recon, points)
-        # loss = recon_loss + args.commit_weight * commit_loss
-        loss = recon_loss
-
-        loss.backward()
-        self.vae_optimizer.step()
-
-        return {
-            'tokenizer_loss': loss.item(),
-            'recon_loss': recon_loss.item(),
-            # 'commit_loss': commit_loss.item()
-        }
-
-    def update_model(self, args, obs, action, reward, pad_mask=None):
-        """Update the diffusion model using denoising loss"""
-        self.model.train()
-        self.model_optimizer.zero_grad()
-        if args.reward.use_reward_model:
-            self.reward_model.train()
-            self.reward_model_optimizer.zero_grad()
-        
-        # Process observations to latent space
-        latent_embeddings = self._process_obs(obs)  # [B, T, C, H, W]
-        
-        # Forward through diffusion model
-        diff_loss = self.model(
-            latent_embeddings, 
-            action,
-            batch_mask_padding=pad_mask
-        )
-        reward_loss, reward_pred = 0.0, None
-        if args.reward.use_reward_model:
-            reward_loss, reward_pred = self.reward_model(
-                latent_embeddings[:, args.context_length:-1], 
-                action[:, args.context_length:-1],
-                latent_embeddings[:, args.context_length+1:], 
-                reward[:, args.context_length:-1]
-            )
-
-        # Calculate losses
-        loss = diff_loss
-        if args.reward.use_reward_model:
-            loss += args.reward.reward_weight * reward_loss
-        
-        # Backward and optimize
-        loss.backward()
-        grad_norm, grad_norms = 0, {}
-        if args.optimizer.max_grad_norm is not None:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.optimizer.max_grad_norm)
-            grad_norm = grad_norm.item()
-        self.model_optimizer.step()
-        if args.reward.use_reward_model:
-            self.reward_model_optimizer.step()
-
-        return {
-            'diff_loss': diff_loss.item(),
-            'model_loss': loss.item(), 
-            **({'reward_loss': reward_loss.item(),
-               'model_train/reward_mean': reward[:, args.context_length:].mean().item(),
-               'model_train/reward_pred_mean': reward_pred.mean().item()} if args.reward.use_reward_model else {}),
-            'model_train/grad_norm': grad_norm,
-            **grad_norms,
-        }
-
     def forward(
         self,
         batch,
@@ -317,7 +202,12 @@ class GaussianPredictor(nn.Module):
     ):
         start = time.time()
         metrics = {}
-        total_loss = torch.tensor(0.0).to(self.device)
+        if update_tokenizer:
+            raise ValueError(
+                "Joint VAE/DiT training is unsupported. Train the VAE with "
+                "gaussianwm.train_vae and keep train.update_tokenizer=false."
+            )
+        total_loss = torch.zeros((), device=self.device)
         
         if len(batch) == 3:
             obs, action, reward = batch
@@ -332,29 +222,6 @@ class GaussianPredictor(nn.Module):
         reward = reward.to(self.device)     # [B, T]
         if self.args.symlog:
             reward = symlog(reward)
-
-        # Calculate VAE loss without optimization
-        if update_tokenizer and self.args.vae.use_vae:
-            B, T, C, H, W = obs.shape
-            obs_flat = obs.reshape(B*T, C, H, W)
-            
-            # Get Gaussian features from Splatt3r
-            with torch.no_grad():
-                points, _ = self.splatt3r.forward_tensor(obs_flat)
-
-            # VAE reconstruction
-            z = self.vae.encode(points)
-            recon = self.vae.decode(z)
-            
-            # Reconstruction loss on Gaussian parameters
-            recon_loss = F.mse_loss(recon, points)
-            vae_loss = recon_loss
-            total_loss += vae_loss
-            
-            metrics.update({
-                'tokenizer_loss': vae_loss.item(),
-                'recon_loss': recon_loss.item(),
-            })
 
         # Calculate model loss without optimization
         if update_model:
@@ -394,10 +261,7 @@ class GaussianPredictor(nn.Module):
                    if self.args.reward.use_reward_model else {}),
             })
 
-        metrics.update({
-            "total_loss": total_loss.item(),
-            "diff_loss": diff_loss.item(),
-        })
+        metrics["total_loss"] = total_loss.item()
         
         return total_loss, metrics
     
@@ -484,11 +348,15 @@ class GaussianPredictor(nn.Module):
             checkpoint["optimizer"] = optimizer.state_dict()
         if step is not None:
             checkpoint["step"] = step
-        torch.save(checkpoint, os.path.join(workdir, f'model{suffix}.pt'))
+        workdir = Path(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        torch.save(checkpoint, workdir / f"model{suffix}.pt")
 
     def load_snapshot(self, workdir, suffix='', optimizer=None):
         # Load works for both DDP and single GPU
-        checkpoint_path = os.path.join(workdir, f'model{suffix}.pt')
+        checkpoint_path = Path(workdir) / f"model{suffix}.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = torch.load(
             checkpoint_path,
             map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu',

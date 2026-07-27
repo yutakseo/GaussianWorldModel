@@ -10,4 +10,7 @@ num_latents: 64 # 8x8
 latent_dim: 64
 output_dim: 14
 use_kl: false
-# perceptual_weight: 0.1
+loss:
+  chamfer_weight: 1.0
+  feature_weight: 1.0
+  kl_weight: 1.0e-3

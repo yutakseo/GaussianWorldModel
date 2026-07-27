@@ -562,10 +562,22 @@ class Splatt3rRegressor(nn.Module):
         assert 1 <= len(image_tensors) <= 2, "Accept 1 or 2 input tensors"
         assert all(t.ndim == 4 for t in image_tensors), "Inputs must be batched (B,C,H,W)"
         
-        # Ensure tensors are on correct device
+        # Mast3r expects normalized encoder inputs in [-1, 1], while
+        # Splatt3r's residual SH head expects the original RGB in [0, 1].
+        # Accept all image ranges used by this repository and construct both
+        # representations explicitly.
         device = image_tensors[0].device
-        view1_tensor = image_tensors[0].to(device)
-        view2_tensor = view1_tensor if len(image_tensors) == 1 else image_tensors[1].to(device)
+        rgb_tensors = []
+        for tensor in image_tensors:
+            rgb = tensor.to(device=device, dtype=torch.float32)
+            if rgb.detach().amax() > 1.0:
+                rgb = rgb / 255.0
+            rgb_tensors.append(rgb.clamp(0.0, 1.0))
+
+        view1_rgb = rgb_tensors[0]
+        view2_rgb = view1_rgb if len(rgb_tensors) == 1 else rgb_tensors[1]
+        view1_tensor = view1_rgb.mul(2.0).sub(1.0)
+        view2_tensor = view2_rgb.mul(2.0).sub(1.0)
 
         # Build input format expected by MAST3RGaussians
         batch_size = view1_tensor.shape[0]
@@ -578,7 +590,7 @@ class Splatt3rRegressor(nn.Module):
                                        dtype=torch.int32, device=device),
             'idx': torch.arange(batch_size, device=device),
             'instance': [str(i) for i in range(batch_size)],
-            'original_img': view1_tensor
+            'original_img': view1_rgb
         }
         view2 = {
             'img': view2_tensor,
@@ -586,7 +598,7 @@ class Splatt3rRegressor(nn.Module):
                                        dtype=torch.int32, device=device),
             'idx': torch.arange(batch_size, device=device),
             'instance': [str(i) for i in range(batch_size)],
-            'original_img': view2_tensor
+            'original_img': view2_rgb
         }
 
         pred1, pred2 = self.model(view1, view2)

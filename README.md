@@ -42,12 +42,22 @@ cd ../../../../..
 
 See [docs/pretraining.md](docs/pretraining.md).
 
+Inside the configured container, no additional virtual environment is needed:
+
+```bash
+./scripts/train.sh all
+./scripts/infer.sh
+```
+
+Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`; no per-run time
+directory is created under `logs`.
+
 ### Docker Compose
 
 The container uses Python 3.10 with PyTorch 2.5.1 and CUDA 12.1. Its entrypoint
 installs the exact dependency versions from `uv.lock`, restores the recursive
-Splatt3r/DUSt3R sources when necessary, builds the CUDA extensions, downloads
-the Splatt3r checkpoint, and links the partial DROID dataset automatically:
+Splatt3r/DUSt3R sources when necessary, builds the CUDA extensions, and
+downloads the Splatt3r checkpoint:
 
 ```bash
 docker compose up --build -d
@@ -73,8 +83,8 @@ will run on several GPU generations, set it before startup, for example:
 TORCH_CUDA_ARCH_LIST='7.5;8.6' docker compose up --build -d
 ```
 
-The DROID dataset is expected at `datasets/droid_100` on the host checkout and
-is linked to the training path `data/droid_100` inside the container.
+The DROID dataset is stored directly at `data/droid_100`; no dataset symlink is
+created by container setup.
 
 ## 🏷️ License
 

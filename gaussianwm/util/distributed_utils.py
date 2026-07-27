@@ -232,6 +232,15 @@ def init_distributed_mode(args):
         args.distributed = False
         return
 
+    # torchrun also exports distributed variables for a one-process launch.
+    # Do not initialize NCCL or wrap the model with DDP in that case.
+    if args.world_size <= 1:
+        torch.cuda.set_device(args.gpu)
+        args.distributed = False
+        setup_for_distributed(is_master=True)
+        print(f"Single-process training on GPU {args.gpu}")
+        return
+
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
@@ -289,10 +298,12 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
 
 
 def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
-    output_dir = Path(args.output_dir)
+    checkpoint_dir = Path(args.checkpoint_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        checkpoint_paths = [
+            checkpoint_dir / ("checkpoint-%s.pth" % epoch_name)
+        ]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),
@@ -305,7 +316,11 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
             save_on_master(to_save, checkpoint_path)
     else:
         client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+        model.save_checkpoint(
+            save_dir=args.checkpoint_dir,
+            tag="checkpoint-%s" % epoch_name,
+            client_state=client_state,
+        )
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):

@@ -1,54 +1,35 @@
-import os
-import sys
-import time
 import logging
+import time
 from pathlib import Path
-from tqdm import tqdm
-from termcolor import cprint
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import numpy as np
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-import cv2
-import imageio
+
 import hydra
-from hydra.utils import instantiate, get_original_cwd
+import torch
 from omegaconf import DictConfig, OmegaConf
-
-import util.distributed_utils as distributed_utils
-from util.logging_utils import print_rich_single_line_metrics, _recursive_flatten_dict
-from util.timer_utils import Timer
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tqdm import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gaussianwm.gwm_predictor import GaussianPredictor
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
-
-def collate_fn(batch):
-    """Custom collate function to handle different dataset formats"""
-    if isinstance(batch[0], tuple) and len(batch[0]) == 4:
-        obs = torch.stack([item[0] for item in batch])
-        action = torch.stack([item[1] for item in batch])
-        reward = torch.stack([item[2] for item in batch])
-        pad_mask = torch.stack([item[3] for item in batch])
-        return obs, action, reward, pad_mask
-    elif isinstance(batch[0], tuple) and len(batch[0]) == 3:
-        obs = torch.stack([item[0] for item in batch])
-        action = torch.stack([item[1] for item in batch])
-        reward = torch.stack([item[2] for item in batch])
-        return obs, action, reward
-    else:
-        raise ValueError(f"Unsupported batch format: {type(batch[0])}")
+from gaussianwm.util import distributed_utils
+from gaussianwm.util.logging_utils import (
+    _recursive_flatten_dict,
+    print_rich_single_line_metrics,
+)
+from gaussianwm.util.runtime import (
+    make_data_loader,
+    prepare_sequence_batch,
+    resolve_path,
+    seed_everything,
+    unwrap_model,
+)
+from gaussianwm.util.timer_utils import Timer
 
 
 def train_step(model, batch, optimizer, step, cfg):
     """Train for one step"""
-    # [B, T, H, W, C] -> [B, T, C, H, W]
-    batch[0] = batch[0].permute(0, 1, 4, 2, 3).to(model.device)
+    batch = prepare_sequence_batch(batch, unwrap_model(model).device)
 
+    optimizer.zero_grad(set_to_none=True)
     total_loss, metrics = model(
         batch,
         update_tokenizer=cfg.train.update_tokenizer,
@@ -56,7 +37,6 @@ def train_step(model, batch, optimizer, step, cfg):
     )
     total_loss.backward()
     optimizer.step()
-    optimizer.zero_grad()
     return metrics
 
 
@@ -67,7 +47,7 @@ def validate(model, val_loader, cfg):
     num_batches = 0
 
     for batch in val_loader:
-        batch[0] = batch[0].permute(0, 1, 4, 2, 3).to(model.device)
+        batch = prepare_sequence_batch(batch, unwrap_model(model).device)
         _, metrics = model(
             batch,
             update_tokenizer=cfg.train.update_tokenizer,
@@ -105,22 +85,15 @@ def log_metrics(metrics, step, logger, use_wandb=False):
         wandb.log(metrics, step=step)
 
 
-@hydra.main(config_path="../configs", config_name="train_gwm")
+@hydra.main(
+    version_base=None, config_path="../configs", config_name="train_gwm"
+)
 def main(cfg: DictConfig):
     distributed_utils.init_distributed_mode(cfg.distributed)
-    device = torch.device(cfg.device)
-
     logger = logging.getLogger(__name__)
     logger.info(OmegaConf.to_yaml(cfg))
-    
-    work_dir = Path(os.getcwd())
-    logger.info(f"Working directory: {work_dir}")
-    
-    if cfg.seed is not None:
-        np.random.seed(cfg.seed)
-        torch.manual_seed(cfg.seed)
-        torch.cuda.manual_seed_all(cfg.seed)
-        # torch.backends.cudnn.deterministic = True
+
+    seed_everything(cfg.seed)
     
     if cfg.use_wandb and distributed_utils.is_main_process():
         import wandb
@@ -141,32 +114,30 @@ def main(cfg: DictConfig):
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
     
-    train_loader = DataLoader(
+    train_loader = make_data_loader(
         train_dataset,
         batch_size=cfg.world_model.batch_size,
-        # sampler=train_sampler,
         num_workers=cfg.dataloader.num_workers,
-        # pin_memory=True,
-        # collate_fn=collate_fn,
-        # drop_last=True
+        pin_memory=cfg.dataloader.pin_memory,
     )
-    val_loader = DataLoader(
+    val_loader = make_data_loader(
         val_dataset,
         batch_size=cfg.world_model.batch_size,
-        # sampler=val_sampler,
         num_workers=cfg.dataloader.num_workers,
-        # pin_memory=True,
-        # collate_fn=collate_fn,
-        # drop_last=True
+        pin_memory=cfg.dataloader.pin_memory,
     )
-    
+
+    checkpoint_dir = Path(cfg.checkpoint_dir)
+    if distributed_utils.is_main_process():
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     start_step = cfg.start_step
     if cfg.resume:
-        resume_path = Path(cfg.resume).expanduser().resolve()
+        resume_path = resolve_path(cfg.resume, Path.cwd())
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         logger.info(f"Loading checkpoint from {resume_path}")
-        model_to_load = model.module if cfg.distributed.distributed else model
+        model_to_load = unwrap_model(model)
         loaded_step = model_to_load.load_snapshot(
             resume_path.parent,
             suffix=resume_path.stem.removeprefix("model"),
@@ -240,10 +211,7 @@ def main(cfg: DictConfig):
         
         if is_main_process and step % cfg.train.save_every == 0 and step > 0:
             logger.info(f"Saving model checkpoint at step {step}")
-            # checkpoint_dir = work_dir / "checkpoints"
-            checkpoint_dir = Path(cfg.output_dir) / "checkpoints"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            model_to_save = model.module if cfg.distributed.distributed else model
+            model_to_save = unwrap_model(model)
             model_to_save.save_snapshot(
                 checkpoint_dir, suffix=f"_{step}", optimizer=optimizer, step=step
             )
@@ -252,10 +220,12 @@ def main(cfg: DictConfig):
             )
     
     logger.info("Saving final model")
-    final_dir = checkpoint_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if cfg.distributed.distributed else model
-    model_to_save.save_snapshot(final_dir, optimizer=optimizer, step=step)
+    if is_main_process:
+        final_dir = checkpoint_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        unwrap_model(model).save_snapshot(
+            final_dir, optimizer=optimizer, step=step
+        )
     
     logger.info("Training completed!")
 

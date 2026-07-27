@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import json
 import logging
@@ -12,21 +11,20 @@ from tqdm import tqdm
 from termcolor import cprint
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import einops
-from pytorch3d.ops import sample_farthest_points as fps
+from pytorch3d.loss import chamfer_distance
+from pytorch3d.ops import knn_gather, knn_points, sample_farthest_points as fps
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from processor.regressor import Splatt3rRegressor
+from gaussianwm.processor.regressor import Splatt3rRegressor
 from gaussianwm.encoder.models_ae import create_autoencoder
-import util.distributed_utils as distributed_utils
-import util.lr_utils as lr_utils
-import util.tensor_utils as TensorUtils
-from processor.datasets import build_gaussian_splatting_reconstruction_dataset
-from util.distributed_utils import NativeScalerWithGradNormCount as NativeScaler
+from gaussianwm.util import distributed_utils, lr_utils
+from gaussianwm.util import tensor_utils as TensorUtils
+from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
+from gaussianwm.util.distributed_utils import NativeScalerWithGradNormCount as NativeScaler
 
 
 class GaussianFeatureCache:
@@ -63,7 +61,44 @@ class GaussianFeatureCache:
         os.replace(tmp_path, path)
 
 
-def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, loss_scaler,
+def vae_reconstruction_loss(model, points, cfg):
+    """Train the same latent-only decoder path used at inference."""
+    encoded = model.encode(points)
+    if isinstance(encoded, tuple):
+        kl, latents = encoded
+        loss_kl = kl.sum() / kl.shape[0]
+    else:
+        latents = encoded
+        loss_kl = None
+
+    reconstructed = model.decode(latents).float()
+    targets = points.float()
+    loss_chamfer, _ = chamfer_distance(
+        reconstructed[..., :3],
+        targets[..., :3],
+        batch_reduction="mean",
+        point_reduction="mean",
+    )
+    nearest = knn_points(
+        reconstructed[..., :3], targets[..., :3], K=1
+    )
+    target_features = knn_gather(
+        targets[..., 3:], nearest.idx
+    ).squeeze(2)
+    loss_features = F.smooth_l1_loss(
+        reconstructed[..., 3:], target_features
+    )
+
+    loss = (
+        cfg.vae.loss.chamfer_weight * loss_chamfer
+        + cfg.vae.loss.feature_weight * loss_features
+    )
+    if loss_kl is not None:
+        loss = loss + cfg.vae.loss.kl_weight * loss_kl
+    return loss, loss_chamfer, loss_features, loss_kl
+
+
+def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
                     max_norm=0, log_writer=None, cfg=None):
     model.train()
     metric_logger = distributed_utils.MetricLogger(delimiter="  ")
@@ -78,8 +113,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
         cfg.gaussian_cache.dtype,
     )
     accum_iter = cfg.train.accum_iter
-    kl_weight = 1e-3
-
     optimizer.zero_grad()
 
     if log_writer is not None:
@@ -105,31 +138,14 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
             ):
                 points, _ = splatt3r.forward_tensor(image1)
 
-            SH_C0 = 0.28209479177387814
-            points[..., -4:-1] = (0.5 + SH_C0 * points[..., -4:-1]) / 255.0
-            points, _ = fps(points.float(), K=cfg.model.point_cloud_size)
+            points, _ = fps(points.float(), K=cfg.vae.point_cloud_size)
             cache.save(data_iter_step, points)
-        labels = points.clone()
-
         points = points.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-            outputs = model(points, points)
-
-            if 'kl' in outputs:
-                loss_kl = outputs['kl']
-                loss_kl = torch.sum(loss_kl) / loss_kl.shape[0]
-            else:
-                loss_kl = None
-
-            outputs = outputs['logits']
-            loss_vol = criterion(outputs, labels)
-
-            if loss_kl is not None:
-                loss = loss_vol + kl_weight * loss_kl
-            else:
-                loss = loss_vol
+            loss, loss_chamfer, loss_features, loss_kl = (
+                vae_reconstruction_loss(model, points, cfg)
+            )
 
         loss_value = loss.item()
 
@@ -147,7 +163,8 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
-        metric_logger.update(loss_vol=loss_vol.item())
+        metric_logger.update(loss_chamfer=loss_chamfer.item())
+        metric_logger.update(loss_features=loss_features.item())
 
         if loss_kl is not None:
             metric_logger.update(loss_kl=loss_kl.item())
@@ -169,7 +186,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, los
 @torch.no_grad()
 def evaluate(model, data_loader, device, cfg):
     model.eval()
-    criterion = torch.nn.MSELoss()
     splatt3r = None
     cache = GaussianFeatureCache(
         cfg.gaussian_cache.dir,
@@ -194,34 +210,19 @@ def evaluate(model, data_loader, device, cfg):
             with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
                 points, _ = splatt3r.forward_tensor(image1)
 
-            SH_C0 = 0.28209479177387814
-            points[..., -4:-1] = (0.5 + SH_C0 * points[..., -4:-1]) / 255.0
-            points, _ = fps(points.float(), K=cfg.model.point_cloud_size)
+            points, _ = fps(points.float(), K=cfg.vae.point_cloud_size)
             cache.save(batch_index, points)
 
-        labels = points.clone()
         points = points.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-            outputs = model(points, points)
-
-            if 'kl' in outputs:
-                loss_kl = outputs['kl']
-                loss_kl = torch.sum(loss_kl) / loss_kl.shape[0]
-            else:
-                loss_kl = None
-
-            outputs = outputs['logits']
-            loss_vol = criterion(outputs, labels)
-
-            if loss_kl is not None:
-                loss = loss_vol + 1e-3 * loss_kl
-            else:
-                loss = loss_vol
+            loss, loss_chamfer, loss_features, loss_kl = (
+                vae_reconstruction_loss(model, points, cfg)
+            )
 
         metric_logger.update(loss=loss.item())
-        metric_logger.update(loss_vol=loss_vol.item())
+        metric_logger.update(loss_chamfer=loss_chamfer.item())
+        metric_logger.update(loss_features=loss_features.item())
 
         if loss_kl is not None:
             metric_logger.update(loss_kl=loss_kl.item())
@@ -235,8 +236,7 @@ def evaluate(model, data_loader, device, cfg):
 def main(cfg: DictConfig):
     cfg.distributed.distributed = cfg.distributed.world_size > 1
 
-    if cfg.output_dir:
-        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     distributed_utils.init_distributed_mode(cfg.distributed)
 
@@ -249,7 +249,7 @@ def main(cfg: DictConfig):
     if cfg.use_wandb and distributed_utils.is_main_process():
         wandb.init(
             project=cfg.wandb.project,
-            name=cfg.wandb.name or cfg.model.name,
+            name=cfg.wandb.name or cfg.vae.name,
             sync_tensorboard=True
         )
 
@@ -321,9 +321,9 @@ def main(cfg: DictConfig):
 
     optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=cfg.optimizer.lr)
     loss_scaler = NativeScaler()
-    criterion = torch.nn.MSELoss()
-
-    logger.info(f"Criterion: {criterion}")
+    logger.info(
+        "Criterion: center Chamfer + nearest Gaussian feature SmoothL1"
+    )
 
     distributed_utils.load_model(args=cfg, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
@@ -337,7 +337,7 @@ def main(cfg: DictConfig):
 
     for epoch in range(cfg.start_epoch, cfg.train.epochs):
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
+            model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             cfg.optimizer.clip_grad,
             log_writer=log_writer,
@@ -353,7 +353,7 @@ def main(cfg: DictConfig):
                 for name, value in val_stats.items():
                     log_writer.add_scalar(f'val/{name}', value, epoch)
 
-        if cfg.output_dir and (epoch % 10 == 0 or epoch + 1 == cfg.train.epochs):
+        if epoch % cfg.train.save_every == 0 or epoch + 1 == cfg.train.epochs:
             distributed_utils.save_model(
                 args=cfg, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
@@ -365,10 +365,11 @@ def main(cfg: DictConfig):
             'n_parameters': n_parameters
         }
 
-        if cfg.output_dir and is_main_process:
+        if is_main_process:
             if log_writer is not None:
                 log_writer.flush()
-            with open(os.path.join(cfg.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+            log_path = Path(cfg.paths.metrics_file)
+            with log_path.open(mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
         if cfg.use_wandb and is_main_process:

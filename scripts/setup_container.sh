@@ -209,18 +209,8 @@ if [[ "${GWM_DOWNLOAD_SPLATT3R:-1}" == "1" && ! -s "${SPLATT3R_CHECKPOINT}" ]]; 
     mv "${checkpoint_tmp}" "${SPLATT3R_CHECKPOINT}"
 fi
 
-if [[ -n "${DROID_DATASET_DIR:-}" ]]; then
-    if [[ ! -d "${DROID_DATASET_DIR}" ]]; then
-        log "DROID dataset not found at ${DROID_DATASET_DIR}; skipping the data link"
-    else
-        dataset_link="${GWM_ROOT}/data/droid_100"
-        mkdir -p "$(dirname "${dataset_link}")"
-        if [[ -e "${dataset_link}" && ! -L "${dataset_link}" ]]; then
-            die "${dataset_link} exists and is not a symlink; refusing to overwrite it"
-        fi
-        ln -sfn "${DROID_DATASET_DIR}" "${dataset_link}"
-        log "DROID dataset linked: ${dataset_link} -> ${DROID_DATASET_DIR}"
-    fi
+if [[ ! -d "${GWM_ROOT}/data/droid_100" ]]; then
+    log "DROID dataset not found at ${GWM_ROOT}/data/droid_100"
 fi
 
 "${PYTHON_BIN}" - <<'PY'

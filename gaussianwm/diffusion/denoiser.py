@@ -39,6 +39,8 @@ class DenoiserConfig:
     sigma_offset_noise: float
     noise_previous_obs: bool
     upsampling_factor: Optional[int] = None
+    quantize_output: bool = True
+    autoregressive_training: bool = False
 
 
 class Denoiser(nn.Module):
@@ -83,9 +85,9 @@ class Denoiser(nn.Module):
             return s.exp().clip(cfg.sigma_min, cfg.sigma_max)
 
         self.sample_sigma_training = sample_sigma
-    
+
     def apply_noise(self, x: Tensor, sigma: Tensor, sigma_offset_noise: float) -> Tensor:
-        b, c, _, _ = x.shape 
+        b, c, _, _ = x.shape
         offset_noise = sigma_offset_noise * torch.randn(b, c, 1, 1, device=self.device)
         return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
 
@@ -111,11 +113,23 @@ class Denoiser(nn.Module):
             batch_action: (B, T, A)
             batch_mask_padding: (B, T)
         """
-        
+
         b, t, c, h, w = batch_obs.size()
         H, W = (self.cfg.upsampling_factor * h, self.cfg.upsampling_factor * w) if self.is_upsampler else (h, w)
         n = self.cfg.inner_model.context_length
         seq_length = t - n  # t = n + 1 + num_autoregressive_steps
+        if batch_action.size(1) < t - 1:
+            raise ValueError(
+                f"Need at least {t - 1} aligned actions for {t} observations, "
+                f"got {batch_action.size(1)}"
+            )
+        if batch_mask_padding is not None:
+            if batch_mask_padding.shape != (b, t):
+                raise ValueError(
+                    "padding mask must have shape "
+                    f"{(b, t)}, got {tuple(batch_mask_padding.shape)}"
+                )
+            batch_mask_padding = batch_mask_padding.to(torch.bool)
 
         # if self.is_upsampler:
         #     all_obs = torch.stack([x["full_res"] for x in batch.info]).to(self.device)
@@ -124,14 +138,16 @@ class Denoiser(nn.Module):
         # else:
         all_obs = batch_obs.clone()
 
-        loss = 0
+        loss = batch_obs.new_zeros(())
+        loss_steps = 0
         reward_preds = []   # [B, seq_length]
-        
+
         for i in range(seq_length):
             prev_obs = all_obs[:, i : n + i].reshape(b, n * c, H, W)
             # prev_act = None if self.is_upsampler else batch_action[:, i : n + i]
-            
-            # only use the last action
+
+            # action[k] is applied after observation[k] and conditions the
+            # prediction of observation[k + 1].
             prev_act = batch_action[:, n + i - 1, :].unsqueeze(1)
 
             obs = all_obs[:, n + i]
@@ -160,21 +176,31 @@ class Denoiser(nn.Module):
             target = (obs - cs.c_skip * noisy_obs) / cs.c_out
 
             if mask is not None:
+                if not mask.any():
+                    continue
                 # Apply mask as weights (expanding dimensions for broadcasting)
                 mask_expanded = mask.view(b, 1, 1, 1)
                 weighted_diff = ((model_output - target) ** 2) * mask_expanded
                 loss += weighted_diff.sum() / (mask.sum() * c * h * w + 1e-8)
             else:
                 loss += F.mse_loss(model_output, target)
+            loss_steps += 1
 
-            # with torch.no_grad():
-            denoised = self.wrap_model_output(noisy_obs, model_output, cs)
-            # Remove the line to conduct teacher-forcing
-            all_obs[:, n + i] = denoised
+            if self.cfg.autoregressive_training:
+                # Optional rollout fine-tuning. Base training uses clean
+                # ground-truth contexts (teacher forcing).
+                with torch.no_grad():
+                    denoised = self.wrap_model_output(
+                        noisy_obs, model_output, cs
+                    )
+                    all_obs[:, n + i] = denoised
             # reward_preds.append(self.reward_head(hidden_states[-1].mean(dim=1)))
 
-        loss /= seq_length
-        
+        if loss_steps == 0:
+            # Keep a differentiable zero for an entirely padded batch.
+            return model_output.sum() * 0.0
+        loss /= loss_steps
+
         # reward_pred = torch.stack(reward_preds, dim=1)  # [B, seq_length, 1]
 
         return loss #reward_pred
@@ -182,21 +208,22 @@ class Denoiser(nn.Module):
     @torch.no_grad()
     def wrap_model_output(self, noisy_next_obs: Tensor, model_output: Tensor, cs: Conditioners) -> Tensor:
         d = cs.c_skip * noisy_next_obs + cs.c_out * model_output
-        # Quantize to {0, ..., 255}, then back to [-1, 1]
-        d = d.clamp(-1, 1).add(1).div(2).mul(255).byte().div(255).mul(2).sub(1)
+        if self.cfg.quantize_output:
+            # Legacy RGB path: quantize normalized pixels to 8-bit values.
+            d = d.clamp(-1, 1).add(1).div(2).mul(255).byte().div(255).mul(2).sub(1)
         return d
-    
+
     @torch.no_grad()
-    def denoise(self, noisy_next_obs: Tensor, sigma: Tensor, sigma_cond: Optional[Tensor], 
+    def denoise(self, noisy_next_obs: Tensor, sigma: Tensor, sigma_cond: Optional[Tensor],
                     obs: Tensor, act: Optional[Tensor]) -> Tensor:
         """Denoising without reward prediction"""
         cs = self.compute_conditioners(sigma, sigma_cond)
         model_output, _ = self.compute_model_output(noisy_next_obs, obs, act, cs)
         denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
         return denoised
-    
+
     # @torch.no_grad()
-    # def predict_reward(self, noisy_next_obs: Tensor, sigma: Tensor, obs: Tensor, 
+    # def predict_reward(self, noisy_next_obs: Tensor, sigma: Tensor, obs: Tensor,
     #                  act: Optional[Tensor]) -> Tensor:
     #     """Predict reward using model embeddings without returning denoised observation"""
     #     cs = self.compute_conditioners(sigma, None)

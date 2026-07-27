@@ -12,7 +12,7 @@ paths:
 train:
   max_steps: 100000  # About 13.8 epochs for DROID-100 with batch size 4
   log_every: 10    # Log metrics every N steps
-  save_every: 10000  # Save checkpoint every N steps
+  save_every: 5000  # Save checkpoint every N steps
   # The pretrained Gaussian VAE remains frozen during dynamics training.
   update_tokenizer: false
   update_model: true

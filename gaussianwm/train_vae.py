@@ -25,6 +25,7 @@ from gaussianwm.util import distributed_utils, lr_utils
 from gaussianwm.util import tensor_utils as TensorUtils
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
 from gaussianwm.util.distributed_utils import NativeScalerWithGradNormCount as NativeScaler
+from gaussianwm.util.plot_training_metrics import render as render_loss_plot
 
 
 class GaussianFeatureCache:
@@ -302,7 +303,8 @@ def main(cfg: DictConfig):
         latent_dim=cfg.vae.latent_dim,
         output_dim=cfg.vae.output_dim,
         N=cfg.vae.point_cloud_size,
-        deterministic=not cfg.vae.use_kl
+        deterministic=not cfg.vae.use_kl,
+        decoder_num_queries=cfg.vae.get("decoder_num_queries", None),
     ).to(device)
 
     model_without_ddp = model
@@ -386,6 +388,11 @@ def main(cfg: DictConfig):
             log_path = Path(cfg.paths.metrics_file)
             with log_path.open(mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+            render_loss_plot(
+                log_path,
+                Path(cfg.paths.loss_plot),
+                smooth_window=min(10, max(1, epoch + 1)),
+            )
 
         if cfg.use_wandb and is_main_process:
             wandb.log(log_stats)

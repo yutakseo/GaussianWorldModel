@@ -17,50 +17,167 @@ from omegaconf import DictConfig
 from termcolor import cprint
 
 from gaussianwm.gwm_predictor import GaussianPredictor
+from gaussianwm.processor.regressor import gaussian_feature_to_dim
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
 from gaussianwm.util.runtime import resolve_path, seed_everything
+from src.pixelsplat_src.cuda_splatting import render_cuda
+from utils.geometry import build_covariance
 
 
-def save_rollout_video(gt_frames, pred_frames, save_path, fps=4):
+def save_rollout_video(
+    gt_frames, source_frames, vae_frames, pred_frames, save_path, fps=4
+):
     frames = []
-    
+
     for t in range(len(gt_frames)):
         gt_frame = gt_frames[t]
+        source_frame = source_frames[t]
+        vae_frame = vae_frames[t]
         pred_frame = pred_frames[t]
         
         # gt_frame and pred_frame are already in HWC format and properly typed
         frame_error = np.abs(gt_frame.astype(float) - pred_frame.astype(float)).astype(np.uint8)
         
-        combined_frame = np.concatenate([gt_frame, pred_frame, frame_error], axis=1)
+        combined_frame = np.concatenate(
+            [gt_frame, source_frame, vae_frame, pred_frame, frame_error],
+            axis=1,
+        )
         frames.append(combined_frame)
     
     imageio.mimsave(save_path, frames, fps=fps, loop=0)
     cprint(f"Saved rollout video to {save_path.absolute()}", 'green')
 
 
-def gaussian_preview(model, latent, image_size):
-    """Build a diagnostic RGB preview; this is not Gaussian rasterization."""
+def decode_gaussians(model, latent):
+    """Decode one latent frame into the Gaussian parameter representation."""
     if model.args.vae.use_vae:
         latent = latent.permute(1, 2, 0).reshape(
             1, model.args.vae.num_latents, -1
         )
-        decoded = model.vae.decode(latent)[0]
-        side = int(np.sqrt(decoded.shape[0]))
-        decoded = decoded[: side * side].reshape(side, side, -1)
-        rgb = decoded[..., 10:13].permute(2, 0, 1).unsqueeze(0)
+        return model.vae.decode(latent).float()
+    return latent.permute(1, 2, 0).reshape(1, -1, latent.shape[0]).float()
+
+
+def estimate_intrinsics_from_gaussians(gaussians, source_shape):
+    """Estimate normalized pinhole intrinsics from dense pixel-aligned points.
+
+    Splatt3r emits one Gaussian per source pixel in the source-camera frame.
+    DROID's public RGB stream is unposed and does not expose calibration, so
+    the point/pixel correspondences are a better rendering calibration than a
+    hard-coded field of view.
+    """
+    height, width = source_shape
+    means = gaussians[..., :3].reshape(height, width, 3).float()
+    y, x = torch.meshgrid(
+        (
+            torch.arange(height, device=means.device, dtype=means.dtype) + 0.5
+        ) / height,
+        (
+            torch.arange(width, device=means.device, dtype=means.dtype) + 0.5
+        ) / width,
+        indexing="ij",
+    )
+    z = means[..., 2]
+    qx = means[..., 0] / z.clamp_min(1e-6)
+    qy = means[..., 1] / z.clamp_min(1e-6)
+    valid = torch.isfinite(means).all(dim=-1) & (z > 1e-4)
+
+    def fit_focal(q, pixel):
+        mask = valid & torch.isfinite(q) & (q.abs() > 1e-4)
+        numerator = (q[mask] * (pixel[mask] - 0.5)).sum()
+        denominator = q[mask].square().sum().clamp_min(1e-8)
+        return (numerator / denominator).abs().clamp(0.25, 4.0)
+
+    intrinsics = torch.eye(
+        3, device=means.device, dtype=means.dtype
+    )
+    intrinsics[0, 0] = fit_focal(qx, x)
+    intrinsics[1, 1] = fit_focal(qy, y)
+    intrinsics[0, 2] = 0.5
+    intrinsics[1, 2] = 0.5
+    return intrinsics
+
+
+def render_gaussian_tensor(gaussians, image_size, intrinsics):
+    """Rasterize an already-decoded [N, 14] Gaussian tensor."""
+    decoded = gaussians.unsqueeze(0) if gaussians.ndim == 2 else gaussians
+    intrinsics = intrinsics.unsqueeze(0) if intrinsics.ndim == 2 else intrinsics
+    intrinsics = intrinsics.to(device=decoded.device, dtype=decoded.dtype)
+
+    means = decoded[..., 0:3].contiguous()
+    scales = decoded[..., 3:6].clamp_min(1e-5)
+    rotations = decoded[..., 6:10]
+    rotations = rotations / rotations.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    sh = decoded[..., 10:13, None].contiguous()
+    opacities = decoded[..., 13].clamp(0.0, 1.0)
+    covariances = build_covariance(scales, rotations).contiguous()
+
+    batch_size = decoded.shape[0]
+    extrinsics = torch.eye(
+        4, device=decoded.device, dtype=decoded.dtype
+    ).unsqueeze(0).repeat(batch_size, 1, 1)
+    near = torch.full(
+        (batch_size,), 0.1, device=decoded.device, dtype=decoded.dtype
+    )
+    far = torch.full(
+        (batch_size,), 1000.0, device=decoded.device, dtype=decoded.dtype
+    )
+    background = torch.zeros(
+        batch_size, 3, device=decoded.device, dtype=decoded.dtype
+    )
+    rendered = render_cuda(
+        extrinsics,
+        intrinsics,
+        near,
+        far,
+        image_size,
+        background,
+        means,
+        covariances,
+        sh,
+        opacities,
+        scale_invariant=True,
+        use_sh=True,
+    )[0]
+    return (
+        rendered.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255
+    ).astype(np.uint8)
+
+
+def gaussian_rasterize_preview(model, latent, image_size, intrinsics):
+    """Decode and rasterize Gaussian parameters from the first-camera frame."""
+    decoded = decode_gaussians(model, latent)
+    expected_dim = sum(
+        width
+        for name, width in gaussian_feature_to_dim.items()
+        if name != "means_in_other_view"
+    )
+    if decoded.shape[-1] != expected_dim:
+        raise ValueError(
+            f"Expected {expected_dim} decoded Gaussian channels, "
+            f"got {decoded.shape[-1]}"
+        )
+
+    return render_gaussian_tensor(decoded, image_size, intrinsics)
+
+
+def gaussian_preview(model, latent, image_size, intrinsics=None):
+    """Backward-compatible alias for the real Gaussian rasterization path."""
+    if model.args.observation.use_gs:
+        if intrinsics is None:
+            raise ValueError("Gaussian rendering requires calibrated intrinsics")
+        return gaussian_rasterize_preview(
+            model, latent, image_size, intrinsics
+        )
+    else:
+        rgb = latent[:3]
         rgb = F.interpolate(
-            rgb,
-            size=image_size,
-            mode="bilinear",
+            rgb.unsqueeze(0), size=image_size, mode="bilinear",
             align_corners=False,
         )[0]
-    else:
-        rgb = latent[10:13]
-
-    rgb = rgb * 0.28209479177387814 + 0.5
-    return (
-        rgb.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255
-    ).astype(np.uint8)
+        return (
+            rgb.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255
+        ).astype(np.uint8)
 
 
 def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'):
@@ -125,7 +242,9 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
                 # The trained GWM predicts 14-channel Gaussian features, not
                 # RGB pixels. Encode the full sequence once for the reference,
                 # then autoregressively predict every frame after the context.
-                gt_latents = model.encode_observations(obs.float() / 255.)
+                gt_latents, raw_gaussians = model.encode_observations(
+                    obs.float() / 255.0, return_gaussians=True
+                )
                 frames = [gt_latents[:, t] for t in range(context_length)]
                 predicted = []
                 for t in range(obs.shape[1] - context_length):
@@ -162,32 +281,114 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             cprint(f"MSE: {obs_mse.item():.6f}", 'magenta')
             
             gt_frames = []
+            source_frames = []
+            vae_frames = []
             pred_frames = []
             
             for t in range(rollout_obs.shape[1]):
                 gt_frame = obs[0, context_length + t].cpu().numpy().transpose(1,2,0).astype(np.uint8)
                 gt_frame = np.ascontiguousarray(gt_frame)
                 if cfg.world_model.observation.use_gs:
+                    source_gaussians = raw_gaussians[0, context_length + t]
+                    intrinsics = estimate_intrinsics_from_gaussians(
+                        source_gaussians, gt_frame.shape[:2]
+                    )
+                    source_frame = render_gaussian_tensor(
+                        source_gaussians, gt_frame.shape[:2], intrinsics
+                    )
+                    vae_frame = gaussian_preview(
+                        model, target_obs[0, t], gt_frame.shape[:2],
+                        intrinsics,
+                    )
                     pred_frame = gaussian_preview(
-                        model, rollout_obs[0, t], gt_frame.shape[:2]
+                        model, rollout_obs[0, t], gt_frame.shape[:2],
+                        intrinsics,
                     )
                 else:
+                    source_frame = gt_frame
+                    vae_frame = gt_frame
                     pred_frame = (
                         rollout_obs[0, t].clamp(0, 1).cpu().numpy().transpose(1,2,0) * 255
                     ).astype(np.uint8)
                 pred_frame = np.ascontiguousarray(pred_frame)
                 
                 gt_frames.append(gt_frame)
+                source_frames.append(np.ascontiguousarray(source_frame))
+                vae_frames.append(np.ascontiguousarray(vae_frame))
                 pred_frames.append(pred_frame)
+
+            source_rendered_mse = np.mean(
+                [
+                    np.mean(
+                        (
+                            gt.astype(np.float32) / 255.0
+                            - source.astype(np.float32) / 255.0
+                        )
+                        ** 2
+                    )
+                    for gt, source in zip(gt_frames, source_frames)
+                ]
+            )
+            vae_rendered_mse = np.mean(
+                [
+                    np.mean(
+                        (
+                            gt.astype(np.float32) / 255.0
+                            - vae.astype(np.float32) / 255.0
+                        )
+                        ** 2
+                    )
+                    for gt, vae in zip(gt_frames, vae_frames)
+                ]
+            )
+            rendered_mse = np.mean(
+                [
+                    np.mean(
+                        (
+                            gt.astype(np.float32) / 255.0
+                            - pred.astype(np.float32) / 255.0
+                        )
+                        ** 2
+                    )
+                    for gt, pred in zip(gt_frames, pred_frames)
+                ]
+            )
+            metrics_summary[-1]["vae_rendered_rgb_mse"] = float(
+                vae_rendered_mse
+            )
+            metrics_summary[-1]["source_rendered_rgb_mse"] = float(
+                source_rendered_mse
+            )
+            metrics_summary[-1]["rendered_rgb_mse"] = float(rendered_mse)
+            cprint(
+                f"Source Gaussian RGB MSE: {source_rendered_mse:.6f}",
+                "magenta",
+            )
+            cprint(
+                f"VAE rendered RGB MSE: {vae_rendered_mse:.6f}", "magenta"
+            )
+            cprint(f"Rendered RGB MSE: {rendered_mse:.6f}", "magenta")
             
             video_path = output_dir / f"sample_{i:03d}_rollout.gif"
-            save_rollout_video(gt_frames, pred_frames, video_path)
+            save_rollout_video(
+                gt_frames, source_frames, vae_frames, pred_frames, video_path
+            )
             
             frame_dir = output_dir / f"sample_{i:03d}_frames"
             frame_dir.mkdir(exist_ok=True)
             
-            for t, (gt_frame, pred_frame) in enumerate(zip(gt_frames, pred_frames)):
+            for t, (gt_frame, source_frame, vae_frame, pred_frame) in enumerate(
+                zip(gt_frames, source_frames, vae_frames, pred_frames)
+            ):
                 cv2.imwrite(str(frame_dir / f"gt_frame_{t:03d}.png"), cv2.cvtColor(gt_frame, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(
+                    str(frame_dir / f"source_frame_{t:03d}.png"),
+                    cv2.cvtColor(source_frame, cv2.COLOR_RGB2BGR),
+                )
+                cv2.imwrite(
+                    str(frame_dir / f"vae_frame_{t:03d}.png"),
+                    cv2.cvtColor(vae_frame, cv2.COLOR_RGB2BGR),
+                )
                 cv2.imwrite(str(frame_dir / f"pred_frame_{t:03d}.png"), cv2.cvtColor(pred_frame, cv2.COLOR_RGB2BGR))
             
             cprint(f"Saved frames to {frame_dir.absolute()}", 'green')
@@ -196,10 +397,22 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
     if metrics_summary:
         avg_mse = np.mean([m['mse'] for m in metrics_summary])
         avg_time = np.mean([m['inference_time'] for m in metrics_summary])
-        
+        avg_rendered_mse = np.mean(
+            [m["rendered_rgb_mse"] for m in metrics_summary]
+        )
+        avg_vae_rendered_mse = np.mean(
+            [m["vae_rendered_rgb_mse"] for m in metrics_summary]
+        )
+        avg_source_rendered_mse = np.mean(
+            [m["source_rendered_rgb_mse"] for m in metrics_summary]
+        )
+
         summary = {
             'num_samples': len(metrics_summary),
             'average_mse': avg_mse,
+            'average_source_rendered_rgb_mse': avg_source_rendered_mse,
+            'average_vae_rendered_rgb_mse': avg_vae_rendered_mse,
+            'average_rendered_rgb_mse': avg_rendered_mse,
             'average_inference_time': avg_time,
             'per_sample_metrics': metrics_summary
         }
@@ -208,6 +421,17 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             json.dump(summary, f, indent=2)
         
         cprint(f"Average MSE: {avg_mse:.6f}", 'blue')
+        cprint(
+            f"Average source Gaussian RGB MSE: {avg_source_rendered_mse:.6f}",
+            "blue",
+        )
+        cprint(
+            f"Average VAE rendered RGB MSE: {avg_vae_rendered_mse:.6f}",
+            "blue",
+        )
+        cprint(
+            f"Average rendered RGB MSE: {avg_rendered_mse:.6f}", "blue"
+        )
         cprint(f"Average inference time: {avg_time:.3f}s", 'blue')
         cprint(f"Metrics summary saved to {summary_path.absolute()}", 'green')
     
@@ -233,7 +457,7 @@ def main(cfg: DictConfig):
         raise FileNotFoundError(
             f"GWM checkpoint not found: {checkpoint_path}\n"
             "The upstream repository does not currently publish pretrained "
-            "VAE/DiT weights. Train one with scripts/pretrain/dit.sh, or run "
+            "VAE/DiT weights. Train one with scripts/train.sh dit, or run "
             "the demo with resume=/absolute/path/to/model_latest.pt."
         )
 

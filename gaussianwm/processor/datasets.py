@@ -279,10 +279,14 @@ class DroidDataset(IterableDataset):
             reward = torch.zeros((self.segment_length, 1))  # Dummy reward
             
             # Convert numpy arrays to torch tensors
-            left_frames = torch.from_numpy(left_frames)
-            right_frames = torch.from_numpy(right_frames)
-            action = torch.from_numpy(action)
-            pad_mask = torch.from_numpy(pad_mask).to(torch.bool).squeeze(-1)
+            # RLDS may expose read-only NumPy views. Copy before converting so
+            # PyTorch never receives a tensor with undefined write behavior.
+            left_frames = torch.from_numpy(np.array(left_frames, copy=True))
+            right_frames = torch.from_numpy(np.array(right_frames, copy=True))
+            action = torch.from_numpy(np.array(action, copy=True))
+            pad_mask = torch.from_numpy(
+                np.array(pad_mask, copy=True)
+            ).to(torch.bool).squeeze(-1)
 
             # print(f"{left_frames.shape=}, {left_frames.dtype=}, {left_frames.min()=}, {left_frames.max()=}")
             # left_frames.shape=torch.Size([2, 128, 128, 3]), 

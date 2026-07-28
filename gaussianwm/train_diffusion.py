@@ -16,6 +16,7 @@ from gaussianwm.util.logging_utils import (
     _recursive_flatten_dict,
     print_rich_single_line_metrics,
 )
+from gaussianwm.util.plot_training_metrics import render as render_loss_plot
 from gaussianwm.util.runtime import (
     make_data_loader,
     prepare_sequence_batch,
@@ -73,6 +74,13 @@ def checkpoint_step_from_path(path):
         return int(stem.rsplit("_", 1)[1])
     except (IndexError, ValueError):
         return None
+
+
+def training_step_range(start_step, max_step):
+    """Return an inclusive range whose final optimizer step is max_step."""
+    if start_step > max_step:
+        return range(0)
+    return range(start_step, max_step + 1)
 
 
 def append_metrics(path, step, split, metrics):
@@ -185,15 +193,32 @@ def main(cfg: DictConfig):
     
     is_main_process = distributed_utils.is_main_process()
     metrics_path = resolve_path(cfg.paths.metrics_file, Path.cwd())
+    loss_plot_path = resolve_path(cfg.paths.loss_plot, Path.cwd())
     if is_main_process:
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Starting training...")
+    logger.info(
+        "Training step range: %d through %d (inclusive)",
+        start_step,
+        cfg.train.max_steps,
+    )
+    if start_step > cfg.train.max_steps:
+        logger.info(
+            "Checkpoint already reached max_steps=%d; nothing to train.",
+            cfg.train.max_steps,
+        )
+        return
     step = start_step
 
     train_iter = iter(train_loader)
     
-    progress_bar = tqdm(range(start_step, cfg.train.max_steps), desc="Training", initial=start_step, total=cfg.train.max_steps)
+    progress_bar = tqdm(
+        training_step_range(start_step, cfg.train.max_steps),
+        desc="Training",
+        initial=start_step,
+        total=cfg.train.max_steps + 1,
+    )
     timer = Timer()
     for step in progress_bar:
         with timer.context("data"):
@@ -219,6 +244,11 @@ def main(cfg: DictConfig):
             if is_main_process:
                 log_metrics(metrics_final, step, logger, cfg.use_wandb)
                 append_metrics(metrics_path, step, "train", step_metrics)
+                if step % cfg.train.plot_every == 0:
+                    render_loss_plot(
+                        metrics_path, loss_plot_path,
+                        smooth_window=max(1, cfg.train.plot_every // cfg.train.log_every),
+                    )
                 print_rich_single_line_metrics(metrics)
 
         if step % cfg.eval.eval_every == 0 and step > start_step:
@@ -237,6 +267,10 @@ def main(cfg: DictConfig):
                 append_metrics(
                     metrics_path, step, "validation", validation_metrics
                 )
+                render_loss_plot(
+                    metrics_path, loss_plot_path,
+                    smooth_window=max(1, cfg.train.plot_every // cfg.train.log_every),
+                )
                 print_rich_single_line_metrics(
                     {"validation": validation_metrics}
                 )
@@ -253,9 +287,16 @@ def main(cfg: DictConfig):
     
     logger.info("Saving final model")
     if is_main_process:
+        model_to_save = unwrap_model(model)
+        model_to_save.save_snapshot(
+            checkpoint_dir, suffix=f"_{step}", optimizer=optimizer, step=step
+        )
+        model_to_save.save_snapshot(
+            checkpoint_dir, suffix="_latest", optimizer=optimizer, step=step
+        )
         final_dir = checkpoint_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
-        unwrap_model(model).save_snapshot(
+        model_to_save.save_snapshot(
             final_dir, optimizer=optimizer, step=step
         )
     test_metrics = validate(model, test_loader, cfg)

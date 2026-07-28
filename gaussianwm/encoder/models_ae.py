@@ -194,6 +194,7 @@ class AutoEncoder(nn.Module):
         output_dim=1,
         num_inputs=2048,
         num_latents=512,
+        decoder_num_queries=None,
         heads=8,
         dim_head=64,
         weight_tie_layers=False,
@@ -205,6 +206,18 @@ class AutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
+        self.decoder_num_queries = (
+            num_latents
+            if decoder_num_queries is None
+            else int(decoder_num_queries)
+        )
+        if self.decoder_num_queries <= 0:
+            raise ValueError("decoder_num_queries must be positive")
+        self.decoder_queries = (
+            nn.Parameter(torch.randn(self.decoder_num_queries, queries_dim) * 0.02)
+            if self.decoder_num_queries != self.num_latents
+            else None
+        )
 
         self.cross_attend_blocks = nn.ModuleList([
             PreNorm(dim, Attention(dim, dim, heads = 1, dim_head = dim), context_dim = dim),
@@ -265,6 +278,13 @@ class AutoEncoder(nn.Module):
         if queries is not None:
             queries_embeddings = self.point_embed(queries)
             latents = self.decoder_cross_attn(queries_embeddings, context = x)
+        elif self.decoder_queries is not None:
+            queries_embeddings = self.decoder_queries.unsqueeze(0).expand(
+                x.shape[0], -1, -1
+            )
+            latents = self.decoder_cross_attn(
+                queries_embeddings, context=x
+            )
         else:
             latents = x
 
@@ -293,6 +313,7 @@ class KLAutoEncoder(nn.Module):
         output_dim = 1,
         num_inputs = 2048,
         num_latents = 512,
+        decoder_num_queries = None,
         latent_dim = 64,
         heads = 8,
         dim_head = 64,
@@ -305,6 +326,18 @@ class KLAutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
+        self.decoder_num_queries = (
+            num_latents
+            if decoder_num_queries is None
+            else int(decoder_num_queries)
+        )
+        if self.decoder_num_queries <= 0:
+            raise ValueError("decoder_num_queries must be positive")
+        self.decoder_queries = (
+            nn.Parameter(torch.randn(self.decoder_num_queries, queries_dim) * 0.02)
+            if self.decoder_num_queries != self.num_latents
+            else None
+        )
 
         self.cross_attend_blocks = nn.ModuleList([
             PreNorm(dim, Attention(dim, dim, heads = 1, dim_head = dim), context_dim = dim),
@@ -337,28 +370,19 @@ class KLAutoEncoder(nn.Module):
         self.logvar_fc = nn.Linear(dim, latent_dim)
 
     def encode(self, pc):
-        # pc: B x N x 3
+        # pc: B x N x D
         B, N, D = pc.shape
         assert N == self.num_inputs
-        
-        ###### fps
-        flattened = pc.view(B*N, D)
 
-        batch = torch.arange(B).to(pc.device)
-        batch = torch.repeat_interleave(batch, N)
-
-        pos = flattened
-
-        ratio = 1.0 * self.num_latents / self.num_inputs
-        
-        K = int(N * ratio)
-        batch_tensor = batch.view(-1, 1).repeat(1, 3)
-        _, idx = fps(pos.unsqueeze(0), K=K)
-        idx = idx.squeeze(0)
-        
-        sampled_pc = pos[idx]
-        sampled_pc = sampled_pc.view(B, -1, 3)
-        ######
+        # Sample independently per batch item. The previous flattened FPS
+        # mixed points from different scenes and returned too few tokens per
+        # item whenever B > 1.
+        _, sampled_indices = fps(pc[..., :3], K=self.num_latents)
+        sampled_pc = torch.gather(
+            pc,
+            1,
+            sampled_indices.unsqueeze(-1).expand(-1, -1, D),
+        )
 
         sampled_pc_embeddings = self.point_embed(sampled_pc)
 
@@ -379,7 +403,7 @@ class KLAutoEncoder(nn.Module):
         return kl, x
 
 
-    def decode(self, x, queries):
+    def decode(self, x, queries=None):
 
         x = self.proj(x)
 
@@ -388,7 +412,14 @@ class KLAutoEncoder(nn.Module):
             x = self_ff(x) + x
 
         # cross attend from decoder queries to latents
-        queries_embeddings = self.point_embed(queries)
+        if queries is not None:
+            queries_embeddings = self.point_embed(queries)
+        elif self.decoder_queries is not None:
+            queries_embeddings = self.decoder_queries.unsqueeze(0).expand(
+                x.shape[0], -1, -1
+            )
+        else:
+            queries_embeddings = x
         latents = self.decoder_cross_attn(queries_embeddings, context = x)
 
         # optional decoder feedforward
@@ -397,7 +428,7 @@ class KLAutoEncoder(nn.Module):
         
         return self.to_outputs(latents)
 
-    def forward(self, pc, queries):
+    def forward(self, pc, queries=None):
         kl, x = self.encode(pc)
 
         o = self.decode(x, queries).squeeze(-1)
@@ -406,7 +437,8 @@ class KLAutoEncoder(nn.Module):
         return {'logits': o, 'kl': kl}
 
 def create_autoencoder(
-        dim=512, M=512, depth=24, latent_dim=64, output_dim=1, N=2048, deterministic=False
+        dim=512, M=512, depth=24, latent_dim=64, output_dim=1, N=2048,
+        deterministic=False, decoder_num_queries=None
     ):
     if deterministic:
         model = AutoEncoder(
@@ -416,6 +448,7 @@ def create_autoencoder(
             output_dim=output_dim,
             num_inputs=N,
             num_latents=M,
+            decoder_num_queries=decoder_num_queries,
             heads=8,
             dim_head=64,
         )
@@ -427,6 +460,7 @@ def create_autoencoder(
             output_dim=output_dim,
             num_inputs=N,
             num_latents=M,
+            decoder_num_queries=decoder_num_queries,
             latent_dim=latent_dim,
             heads=8,
             dim_head=64,
@@ -434,53 +468,53 @@ def create_autoencoder(
     return model
 
 def kl_d512_m512_l512(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=512, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=512, N=N, deterministic=False)
     
 def kl_d512_m512_l64(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=64, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=64, N=N, deterministic=False)
 
 def kl_d512_m512_l32(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=32, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=32, N=N, deterministic=False)
 
 def kl_d512_m512_l16(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=16, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=16, N=N, deterministic=False)
 
 def kl_d512_m512_l8(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=8, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=8, N=N, deterministic=False)
 
 def kl_d512_m512_l4(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=4, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=4, N=N, deterministic=False)
 
 def kl_d512_m512_l2(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=2, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=2, N=N, deterministic=False)
 
 def kl_d512_m512_l1(N=2048):
-    return create_autoencoder(dim=512, M=512, latent_dim=1, N=N, determinisitc=False)
+    return create_autoencoder(dim=512, M=512, latent_dim=1, N=N, deterministic=False)
 
 ###
 def ae_d512_m512(N=2048):
-    return create_autoencoder(dim=512, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=512, N=N, deterministic=True)
 
 def ae_d512_m256(N=2048):
-    return create_autoencoder(dim=512, M=256, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=256, N=N, deterministic=True)
 
 def ae_d512_m128(N=2048):
-    return create_autoencoder(dim=512, M=128, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=128, N=N, deterministic=True)
 
 def ae_d512_m64(N=2048):
-    return create_autoencoder(dim=512, M=64, N=N, determinisitc=True)
+    return create_autoencoder(dim=512, M=64, N=N, deterministic=True)
 
 ###
 def ae_d256_m512(N=2048):
-    return create_autoencoder(dim=256, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=256, M=512, N=N, deterministic=True)
 
 def ae_d128_m512(N=2048):
-    return create_autoencoder(dim=128, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=128, M=512, N=N, deterministic=True)
 
 def ae_d64_m512(N=2048):
-    return create_autoencoder(dim=64, M=512, N=N, determinisitc=True)
+    return create_autoencoder(dim=64, M=512, N=N, deterministic=True)
 
 # low-resolution autoencoder
 def ae_d64_m64(N=2048):
-    return create_autoencoder(dim=128, M=128, depth=4, output_dim=3, N=N, determinisitc=True)
+    return create_autoencoder(dim=128, M=128, depth=4, output_dim=3, N=N, deterministic=True)
 

@@ -9,12 +9,16 @@ paths:
   time: ${now:%H-%M-%S}
   checkpoint_root: ckpt
   log_root: logs
+  # Training defaults to logs/train/{vae,dit}/DATE. Inference overrides this
+  # with "infer", yielding logs/infer/DATE.
+  log_stage: train/${paths.stage}
   output_root: outputs
   cache_root: cache
   checkpoint_dir: ${paths.checkpoint_root}/${paths.stage}/${paths.date}
-  log_dir: ${paths.log_root}/${paths.stage}/${paths.date}
+  log_dir: ${paths.log_root}/${paths.log_stage}/${paths.date}
   log_file: ${paths.log_dir}/${paths.time}.log
   metrics_file: ${paths.log_dir}/${paths.time}.metrics.jsonl
+  loss_plot: ${paths.log_dir}/${paths.time}.loss.png
   inference_dir: ${paths.output_root}/${paths.date}/${paths.time}
 
 dataloader:
@@ -48,5 +52,5 @@ hydra:
       handlers:
         - console
   sweep:
-    dir: ${paths.log_root}/${paths.stage}/${paths.date}
+    dir: ${paths.log_root}/${paths.log_stage}/${paths.date}
     subdir: .

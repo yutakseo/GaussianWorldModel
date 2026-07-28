@@ -121,7 +121,7 @@ log "Python=$("${PYTHON_BIN}" --version 2>&1), CUDA_HOME=${CUDA_HOME}, CUDA arch
 ensure_splatt3r_source
 
 setup_hash="$({
-    sha256sum pyproject.toml uv.lock scripts/setup_container.sh
+    sha256sum pyproject.toml uv.lock container_setup.sh
     git -C third_party/splatt3r rev-parse HEAD 2>/dev/null || true
     nvcc --version
     "${PYTHON_BIN}" --version

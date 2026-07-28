@@ -27,9 +27,11 @@ vae:
   use_vae: true
   num_latents: 64
   latent_dim: 64
+  # Must match the VAE checkpoint. New dense VAEs use 2048; legacy ones null.
+  decoder_num_queries: null
   vae_depth: 4
   use_kl: false
-  pretrained_path: ${paths.checkpoint_root}/vae/${paths.date}/checkpoint-99.pth
+  pretrained_path: ${paths.checkpoint_root}/vae/${paths.date}/checkpoint-latest.pth
 
 # Reward model parameters
 reward:

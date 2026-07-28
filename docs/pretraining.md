@@ -18,17 +18,17 @@ From the repository root, train both stages in order:
 ./scripts/train.sh all
 ```
 
-The stages can also be run separately. Train the 3D variational autoencoder:
+The stages can also be run separately. Train the dense 3D variational
+autoencoder:
 
 ```bash
 ./scripts/train.sh vae
 ```
 
-This writes weights to `ckpt/vae/YYYY-MM-DD`, logs to
-`logs/vae/YYYY-MM-DD/HH-MM-SS.log`, and reusable Gaussian features to
-`cache/vae/YYYY-MM-DD`. Older VAE checkpoints used inconsistent Splatt3r
-normalization and a decoder-query path that is unavailable at inference; do
-not reuse them.
+This writes weights to `ckpt/vae/YYYY-MM-DD`, logs and the live loss graph to
+`logs/train/vae/YYYY-MM-DD`, and reusable Gaussian features to
+`cache/vae/YYYY-MM-DD`. The encoder keeps 64 latent tokens while the decoder
+uses 2,048 learned queries to reconstruct the complete Gaussian set.
 
 Train the diffusion model:
 
@@ -36,10 +36,26 @@ Train the diffusion model:
 ./scripts/train.sh dit
 ```
 
-The diffusion stage uses `ckpt/vae/YYYY-MM-DD/checkpoint-99.pth`, writes its
-weights to `ckpt/dit/YYYY-MM-DD`, and writes logs to
-`logs/dit/YYYY-MM-DD/HH-MM-SS.log`. Raw-Gaussian DiT checkpoints are not
-architecture-compatible with this latent DiT.
+The diffusion stage uses `ckpt/vae/YYYY-MM-DD/checkpoint-latest.pth`, writes its
+weights to `ckpt/dit/YYYY-MM-DD`, and writes logs and the live loss graph to
+`logs/train/dit/YYYY-MM-DD`. Raw-Gaussian DiT checkpoints are not architecture-
+compatible with this latent DiT.
+
+After stable one-step training, continue with autoregressive rollout
+fine-tuning:
+
+```bash
+VAE_CHECKPOINT=ckpt/vae/2026-07-28/checkpoint-latest.pth \
+./scripts/train.sh rollout ckpt/dit/2026-07-28/model_100000.pt 105000
+```
+
+`train.sh` and `infer.sh` read the VAE checkpoint metadata and automatically
+select the dense or legacy decoder shape.
+
+DiT atomically refreshes `model_latest.pt`, including at a non-periodic final
+step. VAE likewise writes numbered checkpoints and atomically refreshes
+`checkpoint-latest.pth`. Both include optimizer state and the exact resume
+position.
 
 Run a qualitative rollout after training:
 
@@ -61,5 +77,7 @@ The top-level directories have one responsibility:
 - `data`: datasets
 - `ckpt`: VAE and DiT weights, grouped by date
 - `cache`: reusable preprocessed Gaussian features
-- `logs`: dated training and inference logs named `HH-MM-SS.log`
+- `logs/train/vae`: dated VAE logs, metrics, and loss graphs
+- `logs/train/dit`: dated DiT logs, metrics, and loss graphs
+- `logs/infer`: dated inference logs
 - `outputs`: inference images, GIFs, and metrics only

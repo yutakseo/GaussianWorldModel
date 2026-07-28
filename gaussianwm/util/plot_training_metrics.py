@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Continuously overwrite one loss plot from GaussianWM JSONL metrics."""
 
 import argparse
@@ -34,16 +33,34 @@ def read_losses(metrics_path):
         for line in metrics_file:
             try:
                 record = json.loads(line)
-                loss = record["metrics"]["total_loss"]
-                step = record["step"]
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if record.get("split") == "train":
-                train_steps.append(step)
-                train_losses.append(loss)
-            elif record.get("split") == "validation":
-                val_steps.append(step)
-                val_losses.append(loss)
+
+            # DiT emits one structured record per split and optimizer step.
+            if "metrics" in record:
+                try:
+                    loss = record["metrics"]["total_loss"]
+                    step = record["step"]
+                except (KeyError, TypeError):
+                    continue
+                if record.get("split") == "train":
+                    train_steps.append(step)
+                    train_losses.append(loss)
+                elif record.get("split") == "validation":
+                    val_steps.append(step)
+                    val_losses.append(loss)
+                continue
+
+            # VAE emits one flat record per epoch.
+            epoch = record.get("epoch")
+            if epoch is None:
+                continue
+            if record.get("train_loss") is not None:
+                train_steps.append(epoch)
+                train_losses.append(record["train_loss"])
+            if record.get("val_loss") is not None:
+                val_steps.append(epoch)
+                val_losses.append(record["val_loss"])
     return train_steps, train_losses, val_steps, val_losses
 
 

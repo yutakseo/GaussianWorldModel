@@ -32,7 +32,7 @@ services:
       - gaussianwm-uv-cache:/root/.cache/uv
       - gaussianwm-torch-cache:/root/.cache/torch
       - gaussianwm-setup-state:/var/cache/gaussianwm
-    entrypoint: ["bash", "/workspace/scripts/container_entrypoint.sh"]
+    entrypoint: ["bash", "/workspace/container_entrypoint.sh"]
     command: sleep infinity
 
 volumes:

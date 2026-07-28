@@ -302,7 +302,8 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     epoch_name = str(epoch)
     if loss_scaler is not None:
         checkpoint_paths = [
-            checkpoint_dir / ("checkpoint-%s.pth" % epoch_name)
+            checkpoint_dir / ("checkpoint-%s.pth" % epoch_name),
+            checkpoint_dir / "checkpoint-latest.pth",
         ]
         for checkpoint_path in checkpoint_paths:
             to_save = {
@@ -313,7 +314,13 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
                 'args': args,
             }
 
-            save_on_master(to_save, checkpoint_path)
+            if is_main_process():
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path = checkpoint_path.with_name(
+                    f".{checkpoint_path.name}.{os.getpid()}.tmp"
+                )
+                torch.save(to_save, temporary_path)
+                os.replace(temporary_path, checkpoint_path)
     else:
         client_state = {'epoch': epoch}
         model.save_checkpoint(

@@ -42,5 +42,5 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /workspace
 
-ENTRYPOINT ["bash", "/workspace/scripts/container_entrypoint.sh"]
+ENTRYPOINT ["bash", "/workspace/container_entrypoint.sh"]
 CMD ["sleep", "infinity"]

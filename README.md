@@ -56,7 +56,7 @@ cached extension supports the visible GPU before compilation is skipped. To
 run setup manually or after changing dependencies:
 
 ```bash
-docker compose exec gaussianwm bash scripts/setup_container.sh
+docker compose exec gaussianwm bash container_setup.sh
 ```
 
 Set `GWM_DOWNLOAD_SPLATT3R=0` in `docker-compose.yml` if the Splatt3r checkpoint
@@ -83,7 +83,9 @@ Inside the configured container, no additional virtual environment is needed:
 ./scripts/infer.sh
 ```
 
-Logs use `logs/{vae,dit,infer}/YYYY-MM-DD/HH-MM-SS.log`
+Training logs and live loss graphs use
+`logs/train/{vae,dit}/YYYY-MM-DD`; inference logs use
+`logs/infer/YYYY-MM-DD`.
 
 
 ## 🏷️ License

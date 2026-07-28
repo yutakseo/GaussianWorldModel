@@ -79,6 +79,40 @@ class GaussianPredictor(nn.Module):
             from gaussianwm.encoder.models_ae import create_autoencoder
             self.latent_dim = args.vae.latent_dim
             self.num_latents = args.vae.num_latents
+            vae_checkpoint = None
+            decoder_num_queries = args.vae.get(
+                "decoder_num_queries", None
+            )
+            if args.vae.get("pretrained_path"):
+                if not os.path.isfile(args.vae.pretrained_path):
+                    raise FileNotFoundError(
+                        "Gaussian VAE checkpoint not found: "
+                        f"{args.vae.pretrained_path}. Train it first with "
+                        "`bash scripts/train.sh vae`; do not reuse a raw-"
+                        "Gaussian DiT checkpoint with the latent DiT."
+                    )
+                vae_checkpoint = torch.load(
+                    args.vae.pretrained_path, map_location="cpu"
+                )
+                checkpoint_args = vae_checkpoint.get("args", {})
+                checkpoint_vae = (
+                    checkpoint_args.get("vae", {})
+                    if hasattr(checkpoint_args, "get")
+                    else {}
+                )
+                checkpoint_queries = (
+                    checkpoint_vae.get("decoder_num_queries")
+                    if hasattr(checkpoint_vae, "get")
+                    else None
+                )
+                if decoder_num_queries is None:
+                    decoder_num_queries = checkpoint_queries
+                elif checkpoint_queries != decoder_num_queries:
+                    raise ValueError(
+                        "Configured VAE decoder_num_queries "
+                        f"({decoder_num_queries}) does not match checkpoint "
+                        f"metadata ({checkpoint_queries})."
+                    )
             self.vae = create_autoencoder(
                 depth=args.vae.vae_depth,
                 # dim=self.gaussian_feature_dim,
@@ -87,18 +121,11 @@ class GaussianPredictor(nn.Module):
                 latent_dim=self.latent_dim,
                 output_dim=self.gaussian_feature_dim,
                 N=args.observation.point_cloud_size,
-                deterministic=not args.vae.use_kl
+                deterministic=not args.vae.use_kl,
+                decoder_num_queries=decoder_num_queries,
             ).to(device)
-            if args.vae.get("pretrained_path"):
-                if not os.path.isfile(args.vae.pretrained_path):
-                    raise FileNotFoundError(
-                        "Gaussian VAE checkpoint not found: "
-                        f"{args.vae.pretrained_path}. Train it first with "
-                        "`bash scripts/pretrain/vae.sh`; do not reuse a raw-"
-                        "Gaussian DiT checkpoint with the latent DiT."
-                    )
-                checkpoint = torch.load(args.vae.pretrained_path, map_location="cpu")
-                self.vae.load_state_dict(checkpoint["model"])
+            if vae_checkpoint is not None:
+                self.vae.load_state_dict(vae_checkpoint["model"])
                 self.vae.requires_grad_(False).eval()
             cprint(f"[VAE] Trainable parameters: {sum(p.numel() for p in self.vae.parameters() if p.requires_grad)/1e6}M", 'yellow')
             cprint(f"[VAE] Total parameters: {sum(p.numel() for p in self.vae.parameters())/1e6}M", 'yellow')
@@ -157,40 +184,61 @@ class GaussianPredictor(nn.Module):
             self.reward_model_optimizer = torch.optim.AdamW(self.reward_model.parameters(), lr=args.optimizer.reward_model_lr)
 
 
-    def _process_obs(self, obs):
-        """Convert RGB obs to latent embeddings with Gaussian processing (batched version)"""
+    @torch.no_grad()
+    def extract_gaussians(self, obs):
+        """Run frozen Splatt3r once for a normalized BTCHW RGB sequence."""
         B, T, C, H, W = obs.shape
-        embeddings = None
-        
-        if self.args.observation.use_gs:
-            with torch.no_grad():
-                obs_flat = obs.view(B*T, C, H, W)
-                # Get Gaussian features
-                points, _ = self.splatt3r.forward_tensor(obs_flat)  # [B*T, N, 14]
-
-            if self.args.vae.use_vae:   # Get latent representation
-                points, _ = fps(points.float(), K=self.args.observation.point_cloud_size)
-                enc = self.vae.encode(points)
-                if isinstance(enc, tuple):
-                    enc = enc[0]  # [B, T, N, C]
-                enc = enc.view(B, T, -1, enc.shape[-1])
-                embeddings = enc.permute(0, 1, 3, 2).contiguous().view(B, T, enc.shape[-1], self.nh, self.nw)
-                # [B, T, C, H, W]
-            else:
-                # [B*T, N=H*W, C=14] -> [B, T, C=14, H, W]
-                embeddings = points.view(B, T, -1, points.shape[-1]).permute(0, 1, 3, 2).contiguous()
-                # [B, T, C, N]
-                embeddings = embeddings.view(B, T, points.shape[-1], H, W)  # [B, T, C, H, W]
-                # print(f"{embeddings.shape=}")
-        else:
-            embeddings = obs  # [B, T, C, H, W]
-
-        return embeddings
+        obs_flat = obs.reshape(B * T, C, H, W)
+        points, _ = self.splatt3r.forward_tensor(obs_flat)
+        return points.view(B, T, points.shape[-2], points.shape[-1])
 
     @torch.no_grad()
-    def encode_observations(self, obs):
+    def encode_gaussians(self, points):
+        """Encode a [B,T,N,14] Gaussian sequence into the DiT latent grid."""
+        B, T, N, D = points.shape
+        flat_points = points.reshape(B * T, N, D).float()
+        flat_points, _ = fps(
+            flat_points, K=self.args.observation.point_cloud_size
+        )
+        encoded = self.vae.encode(flat_points)
+        if isinstance(encoded, tuple):
+            _, encoded = encoded
+        encoded = encoded.view(B, T, -1, encoded.shape[-1])
+        return encoded.permute(0, 1, 3, 2).contiguous().view(
+            B, T, encoded.shape[-1], self.nh, self.nw
+        )
+
+    def _process_obs(self, obs):
+        """Convert normalized BTCHW RGB observations to model embeddings."""
+        if not self.args.observation.use_gs:
+            return obs
+
+        B, T, _, H, W = obs.shape
+        points = self.extract_gaussians(obs)
+        if self.args.vae.use_vae:
+            return self.encode_gaussians(points)
+
+        return points.permute(0, 1, 3, 2).contiguous().view(
+            B, T, points.shape[-1], H, W
+        )
+
+    @torch.no_grad()
+    def encode_observations(self, obs, return_gaussians=False):
         """Encode RGB sequences into frozen VAE latents for disk caching."""
-        return self._process_obs(obs).detach()
+        if not return_gaussians:
+            return self._process_obs(obs).detach()
+        if not self.args.observation.use_gs:
+            raise ValueError("Raw Gaussians require observation.use_gs=true")
+        points = self.extract_gaussians(obs)
+        embeddings = (
+            self.encode_gaussians(points)
+            if self.args.vae.use_vae
+            else points.permute(0, 1, 3, 2).contiguous().view(
+                obs.shape[0], obs.shape[1], points.shape[-1],
+                obs.shape[-2], obs.shape[-1],
+            )
+        )
+        return embeddings.detach(), points.detach()
 
     def forward(
         self,
@@ -350,7 +398,12 @@ class GaussianPredictor(nn.Module):
             checkpoint["step"] = step
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, workdir / f"model{suffix}.pt")
+        checkpoint_path = workdir / f"model{suffix}.pt"
+        temporary_path = checkpoint_path.with_name(
+            f".{checkpoint_path.name}.{os.getpid()}.tmp"
+        )
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
 
     def load_snapshot(self, workdir, suffix='', optimizer=None):
         # Load works for both DDP and single GPU

@@ -8,6 +8,9 @@ use_vae: true
 vae_depth: 4
 num_latents: 64 # 8x8
 latent_dim: 64
+# Set to 2048 for dense reconstruction. Null preserves compatibility with
+# legacy checkpoints whose decoder emitted one Gaussian per latent token.
+decoder_num_queries: null
 output_dim: 14
 use_kl: false
 loss:

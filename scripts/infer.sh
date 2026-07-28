@@ -17,7 +17,11 @@ export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-VAE_CHECKPOINT="${VAE_CHECKPOINT:-ckpt/vae/${RUN_DATE}/checkpoint-99.pth}"
+DEFAULT_VAE_CHECKPOINT="ckpt/vae/${RUN_DATE}/checkpoint-latest.pth"
+if [[ ! -f "${DEFAULT_VAE_CHECKPOINT}" ]]; then
+    DEFAULT_VAE_CHECKPOINT="ckpt/vae/${RUN_DATE}/checkpoint-99.pth"
+fi
+VAE_CHECKPOINT="${VAE_CHECKPOINT:-${DEFAULT_VAE_CHECKPOINT}}"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
     echo "DiT checkpoint not found: ${CHECKPOINT}" >&2
@@ -41,6 +45,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_BIN}" -m gaussianwm.demo \
     --config-name train_gwm \
     dataset=droid \
     paths.stage=infer \
+    paths.log_stage=infer \
     "paths.date=${RUN_DATE}" \
     "paths.time=${RUN_TIME}" \
     "resume=${CHECKPOINT}" \

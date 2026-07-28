@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from pathlib import Path
@@ -72,6 +73,19 @@ def checkpoint_step_from_path(path):
         return int(stem.rsplit("_", 1)[1])
     except (IndexError, ValueError):
         return None
+
+
+def append_metrics(path, step, split, metrics):
+    """Append one structured metrics record for plotting and later analysis."""
+    record = {
+        "timestamp": time.time(),
+        "step": int(step),
+        "split": split,
+        "metrics": {name: float(value) for name, value in metrics.items()},
+    }
+    with path.open("a", encoding="utf-8") as metrics_file:
+        metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+        metrics_file.flush()
 
 
 
@@ -170,6 +184,9 @@ def main(cfg: DictConfig):
         logger.info(f"Resuming from step {start_step}")
     
     is_main_process = distributed_utils.is_main_process()
+    metrics_path = resolve_path(cfg.paths.metrics_file, Path.cwd())
+    if is_main_process:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Starting training...")
     step = start_step
@@ -201,6 +218,7 @@ def main(cfg: DictConfig):
             # metrics = {k: v / num_steps_for_avg for k, v in metrics_accumulator.items()}
             if is_main_process:
                 log_metrics(metrics_final, step, logger, cfg.use_wandb)
+                append_metrics(metrics_path, step, "train", step_metrics)
                 print_rich_single_line_metrics(metrics)
 
         if step % cfg.eval.eval_every == 0 and step > start_step:
@@ -215,6 +233,9 @@ def main(cfg: DictConfig):
                     step,
                     logger,
                     cfg.use_wandb,
+                )
+                append_metrics(
+                    metrics_path, step, "validation", validation_metrics
                 )
                 print_rich_single_line_metrics(
                     {"validation": validation_metrics}

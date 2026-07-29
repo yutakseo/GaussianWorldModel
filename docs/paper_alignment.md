@@ -1,81 +1,148 @@
-# Paper alignment
+# Paper and public-code alignment
 
-The implementation is based on **GWM: Towards Scalable Gaussian World Models
-for Robotic Manipulation** ([arXiv:2508.17600v2](https://arxiv.org/abs/2508.17600)).
-The paper is the source of truth for model and objective choices; the public
-code release is marked as work in progress.
+This implementation combines the architecture exposed by the
+[public GaussianWM repository](https://github.com/Gaussian-World-Model/gaussianwm)
+with the objectives and 2,048-to-512 setting in
+[GWM: Towards Scalable Gaussian World Models for Robotic Manipulation](https://arxiv.org/abs/2508.17600).
+The repository is explicitly marked work in progress and its VAE training and
+world-model inference paths do not currently share a complete decoder
+interface. The exact boundary used here is therefore recorded below.
+
+## Source priority
+
+When the two sources differ, this project uses:
+
+1. the public repository for the VAE module topology and tensor operations;
+2. the paper for the 2,048/512 cardinalities, variational posterior,
+   reconstruction objective, and EDM hyperparameters;
+3. an explicitly causal implementation for information the released inference
+   code omits.
+
+This is a runnable, source-traceable interpretation. It must not be described
+as the authors' exact unpublished training setup.
 
 ## Implemented specification
 
-| Component | Paper specification | Implementation |
+| Component | Source | Implementation |
 | --- | --- | --- |
-| Gaussian source | Feed-forward Splatt3R | Frozen `Splatt3rRegressor` |
-| VAE input | original point cloud \(N=2{,}048\) | DROID adaptation: center-only FPS to a 2,048-point VAE input |
-| VAE latent set | FPS: \(N=2{,}048\rightarrow M=512\) | 512 tokens of dimension 64 |
-| VAE encoder | 512 FPS queries attend to the 2,048-point context | four cross-attention/FFN blocks |
-| VAE decoder | mirrored self-attention | four self-attention/FFN blocks |
-| VAE posterior | Variational | Gaussian mean/log-variance with KL |
-| VAE objective | center Chamfer + rendered RGB L1 | `vae_reconstruction_loss` |
-| Dynamics | one-step conditional EDM | `GaussianLatentDenoiser` |
-| EDM constants | `sigma_data=0.5`, `P_mean=-0.4`, `P_std=1.2` | `configs/world_model/gwm.yaml` |
-| DiT position/normalization | RoPE and RMSNorm | direct `[B,T,512,64]` token API in `GaussianDiT` |
-| Action conditioning | cross-attention keys/values | action tokens in every DiT block |
-| EDM sampling prior | \(\mathcal{N}(0,\sigma_{\max}^2 I)\) | scaled initial noise in `GaussianDiffusionSampler` |
-| Temporal setup | sequence 12, context 2, one-step prediction | `configs/dataset/droid.yaml` |
-| Prediction horizon | one step per inference | recursive one-step rollout in `demo.py` |
+| Gaussian source | Paper and code | Frozen Splatt3R |
+| VAE input | Paper Appendix B.2 | 2,048 Gaussians, sampled from the dense DROID point map |
+| Encoder queries | Paper and code | center-only FPS, 2,048 to 512 |
+| Encoder | Public code | one query-to-input cross-attention/FFN block |
+| Posterior | Paper | 512 mean/log-variance tokens, reparameterized to `[512,64]` |
+| Decoder trunk | Public code | four latent self-attention/FFN blocks |
+| Decoder output | Public code | 2,048 input-Gaussian queries cross-attend to 512 latent tokens |
+| VAE objective | Paper Eq. (4) | center Chamfer + rendered RGB L1 + weighted KL |
+| Dynamics | Paper | one-step conditional EDM in latent-token space |
+| EDM constants | Paper Appendix B.1 | `sigma_data=0.5`, `P_mean=-0.4`, `P_std=1.2` |
+| DiT | Paper | RoPE self-attention, RMSNorm, time AdaLN, action cross-attention |
+| Temporal setup | Paper | sequence 12, context 2, one-step target |
+| Long rollout | Required causal completion | recursively sample one latent and decode one Gaussian frame |
 
-## Necessary implementation details
+The public VAE entrypoint passes `dim=latent_dim`; both are 64 here. Decoder
+depth remains four. The paper does not report these two implementation values.
 
-The paper does not prescribe the raw neural parameterization of scale,
-rotation, and opacity. The decoder therefore maps unconstrained outputs to
-physical Gaussian parameters:
+## Exact training flow
 
-- scale: `softplus(raw) + 1e-5`;
-- rotation: unit-quaternion normalization;
-- opacity: `sigmoid(raw)`.
+For every RGB frame:
 
-DROID provides unposed RGB rather than calibrated cameras. Intrinsics for the
-rendering objective are estimated from Splatt3R's dense pixel-aligned point map
-before FPS. The paper does not say how a dense Splatt3R output becomes its
-2,048-point VAE input; this repository uses a clearly separated DROID
-adaptation FPS for that step. The paper-specified VAE FPS then reduces the
-2,048-point input to 512 latent queries, which cross-attend to the 2,048-point
-context. Version-6 caches store one image sequence's adapted input and
-intrinsics per entry: this prevents both shuffled-target mix-ups and a new
-cache file for every re-grouped DataLoader batch. A configurable entry cap
-prevents a stochastic upstream data pipeline from consuming unbounded disk;
-cached entries remain readable once the cap is reached.
+```text
+RGB [3,H,W]
+  -> frozen Splatt3R
+  -> dense Gaussians [H*W,14]
+  -> center FPS
+  -> VAE input G_t [2048,14]
 
-## Checkpoint boundary
+G_t
+  -> center FPS queries [512,14]
+  -> one cross-attention encoder block over G_t
+  -> mean/logvar [512,64]
+  -> reparameterization
+  -> z_t [512,64]
 
-The decoder reconstructs one Gaussian for each of the 512 latent points, as in
-the paper's self-attention decoder. The runtime boundary is explicit:
-`VAE encode [2,048,14] -> DiT [512,64] -> VAE decode [512,14]`. It does not
-introduce a separate set of 2,048 learned decoder queries or a fabricated
-`1×N` image grid.
+z_t
+  -> four self-attention decoder blocks
+G_t used again as decoder queries [2048,14]
+  -> query-to-latent cross-attention
+  -> reconstructed Gaussians [2048,14]
+```
 
-The previous deterministic 64-token VAE omitted the paper's rendering loss and
-fed a fabricated square latent grid to a 2D image DiT. Intermediate checkpoints
-that used only one encoder cross-attention layer or 2,048 synthetic decoder
-queries are also incompatible. VAE and DiT checkpoints include explicit
-architecture metadata and incompatible or legacy checkpoints fail rather than
-loading silently.
+This matches the released standalone VAE call `model(points, points)`: the
+second `points` argument determines decoder output cardinality. The training
+loss follows the paper rather than the released scaffold's parameter-wise MSE:
 
-## Dataset scope
+```text
+L_VAE = Chamfer(center(G_hat), center(G))
+      + L1(render(G_hat), render(G))
+      + 1e-3 * KL(q(z|G) || N(0,I))
+```
 
-The paper evaluates MetaWorld, RoboCasa, and Franka PnP. This repository keeps
-its existing DROID data pipeline and directory structure. DROID results should
-therefore be treated as a new-domain adaptation, not a reproduction of the
-paper's reported metrics. The paper does not specify camera intrinsics,
-Gaussian raw-output activations, the VAE latent channel width, encoder depth,
-or KL weight; the values documented above are implementation choices and must
-not be presented as author-reported hyperparameters.
+After VAE training, Splatt3R and the VAE are frozen. For every valid transition,
+the DiT receives two clean context latent frames, one noised next-frame latent,
+the EDM noise embedding, and the action aligned with that transition. It
+predicts the EDM preconditioned target. Teacher forcing is used across all
+one-step transitions in a 12-frame training window.
 
-DROID samples in this repository do not contain the task rewards required by
-the paper's model-based RL stage, so `reward.use_reward_model` remains disabled
-by default. The existing Conv/ResBlock + LSTM reward model is image-grid based
-and is explicitly rejected for the direct Gaussian-token pipeline; it requires
-a separate token reward head and real reward labels. Policy optimization and
-the paper's RoboCasa/MetaWorld behavioral-cloning and MBPO loops are not
-included; the code here covers world-state encoding, dynamics training, and
-rollout only.
+Two released-predictor statements are treated as execution defects rather than
+model choices. Its KL encoder path selects tuple element zero, which is the
+batch KL value rather than latent tokens, and it reshapes `num_latents` through
+`int(sqrt(num_latents))`. The latter drops tokens when `num_latents=512`
+because 512 is not a square. Here tuple element one is used and the DiT keeps a
+direct `[B,T,512,64]` token tensor without fabricating an image grid.
+
+## Exact inference flow
+
+The released query-based KL decoder cannot reconstruct from `z` alone, yet the
+released predictor calls `decode(z)` without its required second argument.
+Future target Gaussians are unavailable in a real rollout. This implementation
+therefore makes the missing causal contract explicit:
+
+1. encode the two observed context frames to `[2,512,64]`;
+2. sample the next `[512,64]` latent with EDM conditioned on the current action;
+3. for the first prediction, use the last observed 2,048 Gaussians as decoder
+   queries;
+4. decode `[512,64] + [2048,14] -> [2048,14]`;
+5. append the sampled latent to DiT context and use the decoded prediction as
+   the next frame's 2,048 decoder queries;
+6. repeat for the requested horizon.
+
+No future frame, future Gaussian, or future-derived camera intrinsics enter the
+prediction path. Ground-truth future queries are used only to measure the
+single-frame VAE reconstruction baseline. Rollout rendering uses intrinsics
+estimated once from the last observed context frame.
+
+## Important limitation of the public decoder
+
+The latent is not a self-contained tokenization under the public query
+decoder: reconstruction also depends on a full 14-channel Gaussian query set.
+During VAE training that query set is the target itself, whereas causal rollout
+uses the previous frame. This creates a train/inference conditioning shift and
+allows a shortcut through query features. The public release neither specifies
+nor implements a different future-query generator.
+
+Set `decoder_num_queries: null` to use the alternative latent-only decoder,
+which emits 512 Gaussians and needs no external queries. That path is closer to
+the paper's displayed self-attention decoder equation, but it is not the
+standalone VAE training path in the public repository. The default configuration
+now follows the public query decoder.
+
+## Checkpoints and evaluation
+
+Version-6 VAE checkpoints record the one-block encoder, 512-token posterior,
+and 2,048-query decoder. Version-6 DiT checkpoints also record the causal
+`previous_frame` query strategy and a serialization-independent SHA-256
+identity of the frozen VAE weights used to create its latent training targets.
+This prevents a DiT
+from silently running with a same-shaped but semantically different VAE.
+Older or mismatched checkpoints fail fast because their weights or runtime
+interface are incompatible.
+
+Latent MSE is retained only as a diagnostic because FPS latent points are a
+set, not guaranteed correspondences across time. Rollout evaluation also
+reports center Chamfer distance and rendered RGB MSE.
+
+The paper evaluates MetaWorld, RoboCasa, and Franka PnP. This repository uses
+DROID and estimated single-camera intrinsics, so its outputs are a DROID
+adaptation rather than a reproduction of the paper's benchmark numbers.
+Reward learning, behavior cloning, and model-based policy optimization are not
+implemented because the current DROID pipeline supplies dummy rewards.

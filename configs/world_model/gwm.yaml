@@ -24,10 +24,14 @@ observation:
 # 3D VAE parameters
 vae:
   use_vae: true
-  model_dim: 512
+  # The public training entrypoint passes dim=latent_dim=64.
+  model_dim: 64
   num_latents: 512
   latent_dim: 64
-  decoder_num_queries: null
+  decoder_num_queries: 2048
+  # Future target queries are unavailable at inference. Seed the first
+  # decode from the last observed frame, then feed back each prediction.
+  decoder_query_strategy: previous_frame
   vae_depth: 4
   use_kl: true
   min_scale: 1.0e-5

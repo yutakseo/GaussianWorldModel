@@ -35,6 +35,10 @@ gaussian_cache:
   # Bound disk use if a stochastic upstream pipeline emits unbounded windows.
   # Known entries remain readable after the cap; only new misses are skipped.
   max_entries: 40000
+  # Optional read-only adapter for the old version-4 batch cache. It splits
+  # each legacy file back into segment_length sequences, so changing the
+  # current DataLoader batch size cannot duplicate or skip cached samples.
+  legacy_batch_dir: null
 
 # Optimizer settings
 optimizer:

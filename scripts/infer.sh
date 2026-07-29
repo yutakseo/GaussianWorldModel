@@ -2,16 +2,23 @@
 
 set -euo pipefail
 
-# 직접 사용할 체크포인트 경로를 여기서 지정합니다.
-DEFAULT_CHECKPOINT="ckpt/dit/2026-07-29/model_latest.pt"
-DEFAULT_VAE_CHECKPOINT="ckpt/vae/2026-07-29/checkpoint-latest.pth"
-
 DEFAULT_OUTPUT_ROOT="outputs"
 DEFAULT_NUM_SAMPLES="5"
 DEFAULT_PYTHON_BIN="python3"
 DEFAULT_CUDA_DEVICES="0"
 
 validate_args() {
+    if [[ -z "${CHECKPOINT}" ]]; then
+        echo "A DiT checkpoint is required." >&2
+        echo "Usage: VAE_CHECKPOINT=/path/to/checkpoint-latest.pth $0 /path/to/model_latest.pt [output_dir] [num_samples]" >&2
+        return 2
+    fi
+
+    if [[ -z "${VAE_CHECKPOINT}" ]]; then
+        echo "VAE_CHECKPOINT is required for the query-decoder VAE." >&2
+        return 2
+    fi
+
     if [[ ! -f "${CHECKPOINT}" ]]; then
         echo "DiT checkpoint not found: ${CHECKPOINT}" >&2
         return 1
@@ -63,8 +70,8 @@ main() {
 
     RUN_DATE="${RUN_DATE:-$(date -u +%F)}"
     RUN_TIME="${RUN_TIME:-$(date -u +%H-%M-%S)}"
-    CHECKPOINT="${1:-${CHECKPOINT:-${DEFAULT_CHECKPOINT}}}"
-    VAE_CHECKPOINT="${VAE_CHECKPOINT:-${DEFAULT_VAE_CHECKPOINT}}"
+    CHECKPOINT="${1:-${CHECKPOINT:-}}"
+    VAE_CHECKPOINT="${VAE_CHECKPOINT:-}"
     OUTPUT_DIR="${2:-${OUTPUT_DIR:-${DEFAULT_OUTPUT_ROOT}/${RUN_DATE}/${RUN_TIME}}}"
     NUM_SAMPLES="${3:-${NUM_SAMPLES:-${DEFAULT_NUM_SAMPLES}}}"
     PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"

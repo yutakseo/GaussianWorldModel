@@ -261,6 +261,31 @@ def sample_farthest_gaussians(gaussians, num_samples):
     return sampled, sampled_indices
 
 
+def _validate_decoder_queries(queries, latents, expected_queries):
+    """Validate the public repository's Gaussian decoder-query contract."""
+    if queries is None:
+        raise ValueError(
+            "This VAE uses the public-repository query decoder. Pass "
+            "Gaussian queries with shape [B,Q,14] to decode()."
+        )
+    if queries.ndim != 3 or queries.shape[-1] != 14:
+        raise ValueError(
+            "Expected decoder Gaussian queries [B,Q,14], got "
+            f"{tuple(queries.shape)}"
+        )
+    if queries.shape[0] != latents.shape[0]:
+        raise ValueError(
+            "Decoder query and latent batch sizes differ: "
+            f"{queries.shape[0]} != {latents.shape[0]}"
+        )
+    if queries.shape[1] != expected_queries:
+        raise ValueError(
+            f"Expected {expected_queries} decoder queries, "
+            f"got {queries.shape[1]}"
+        )
+    return queries
+
+
 class AutoEncoder(nn.Module):
     def __init__(
         self,
@@ -284,14 +309,19 @@ class AutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
-        if decoder_num_queries is not None:
-            raise ValueError(
-                "The paper-aligned self-attention decoder emits one "
-                "Gaussian per latent and does not support separate decoder "
-                f"queries ({decoder_num_queries} requested)."
-            )
-        self.decoder_num_queries = self.num_latents
+        self.decoder_num_queries = (
+            int(decoder_num_queries)
+            if decoder_num_queries is not None
+            else None
+        )
+        if (
+            self.decoder_num_queries is not None
+            and self.decoder_num_queries <= 0
+        ):
+            raise ValueError("decoder_num_queries must be positive")
 
+        # The public implementation uses one encoder cross-attention block;
+        # ``depth`` controls the latent self-attention decoder stack.
         self.encoder_layers = nn.ModuleList(
             [
                 nn.ModuleList(
@@ -306,7 +336,7 @@ class AutoEncoder(nn.Module):
                         PreNorm(dim, FeedForward(dim)),
                     ]
                 )
-                for _ in range(depth)
+                for _ in range(1)
             ]
         )
 
@@ -326,6 +356,20 @@ class AutoEncoder(nn.Module):
                 get_latent_ff(**cache_args)
             ]))
 
+        self.decoder_cross_attn = (
+            PreNorm(
+                queries_dim,
+                Attention(
+                    queries_dim,
+                    dim,
+                    heads=1,
+                    dim_head=dim,
+                ),
+                context_dim=dim,
+            )
+            if self.decoder_num_queries is not None
+            else None
+        )
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
         self.decoder_norm = nn.LayerNorm(queries_dim)
 
@@ -363,16 +407,26 @@ class AutoEncoder(nn.Module):
 
 
     def decode(self, x, queries=None):
-        if queries is not None:
-            raise ValueError(
-                "The paper-aligned decoder does not accept external queries"
-            )
-
         for self_attn, self_ff in self.layers:
             x = self_attn(x) + x
             x = self_ff(x) + x
 
-        latents = x
+        if self.decoder_cross_attn is not None:
+            queries = _validate_decoder_queries(
+                queries, x, self.decoder_num_queries
+            )
+            query_embeddings = self.point_embed(queries)
+            # Match the public repository: output cardinality is determined
+            # by Q decoder queries, not by M latent tokens.
+            latents = self.decoder_cross_attn(
+                query_embeddings, context=x
+            )
+        else:
+            if queries is not None:
+                raise ValueError(
+                    "The latent-token decoder does not accept external queries"
+                )
+            latents = x
 
         # optional decoder feedforward
         if exists(self.decoder_ff):
@@ -415,14 +469,19 @@ class KLAutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
-        if decoder_num_queries is not None:
-            raise ValueError(
-                "The paper-aligned self-attention decoder emits one "
-                "Gaussian per latent and does not support separate decoder "
-                f"queries ({decoder_num_queries} requested)."
-            )
-        self.decoder_num_queries = self.num_latents
+        self.decoder_num_queries = (
+            int(decoder_num_queries)
+            if decoder_num_queries is not None
+            else None
+        )
+        if (
+            self.decoder_num_queries is not None
+            and self.decoder_num_queries <= 0
+        ):
+            raise ValueError("decoder_num_queries must be positive")
 
+        # Keep the encoder topology of the public repository. Decoder
+        # ``depth`` remains independently configurable.
         self.encoder_layers = nn.ModuleList(
             [
                 nn.ModuleList(
@@ -437,7 +496,7 @@ class KLAutoEncoder(nn.Module):
                         PreNorm(dim, FeedForward(dim)),
                     ]
                 )
-                for _ in range(depth)
+                for _ in range(1)
             ]
         )
 
@@ -457,6 +516,20 @@ class KLAutoEncoder(nn.Module):
                 get_latent_ff(**cache_args)
             ]))
 
+        self.decoder_cross_attn = (
+            PreNorm(
+                queries_dim,
+                Attention(
+                    queries_dim,
+                    dim,
+                    heads=1,
+                    dim_head=dim,
+                ),
+                context_dim=dim,
+            )
+            if self.decoder_num_queries is not None
+            else None
+        )
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
         self.decoder_norm = nn.LayerNorm(queries_dim)
 
@@ -505,20 +578,26 @@ class KLAutoEncoder(nn.Module):
 
 
     def decode(self, x, queries=None):
-        if queries is not None:
-            raise ValueError(
-                "The paper-aligned decoder does not accept external queries"
-            )
-
         x = self.proj(x)
 
         for self_attn, self_ff in self.layers:
             x = self_attn(x) + x
             x = self_ff(x) + x
 
-        # Paper Eq. (3): reconstruct the latent Gaussian set through
-        # self-attention, without synthetic queries.
-        latents = x
+        if self.decoder_cross_attn is not None:
+            queries = _validate_decoder_queries(
+                queries, x, self.decoder_num_queries
+            )
+            query_embeddings = self.point_embed(queries)
+            latents = self.decoder_cross_attn(
+                query_embeddings, context=x
+            )
+        else:
+            if queries is not None:
+                raise ValueError(
+                    "The latent-token decoder does not accept external queries"
+                )
+            latents = x
 
         # optional decoder feedforward
         if exists(self.decoder_ff):

@@ -82,7 +82,8 @@ Inside the configured container, no additional virtual environment is needed:
 
 ```bash
 ./scripts/train.sh all
-./scripts/infer.sh
+VAE_CHECKPOINT=ckpt/vae/YYYY-MM-DD/checkpoint-latest.pth \
+  ./scripts/infer.sh ckpt/dit/YYYY-MM-DD/model_latest.pt
 ```
 
 Training logs and live loss graphs use

@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 
 import time
@@ -32,6 +33,25 @@ def symlog(x):
 
 def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+def state_dict_sha256(state_dict):
+    """Return a serialization-independent identity for model weights."""
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"State entry {name!r} is not a tensor: {type(tensor)!r}"
+            )
+        tensor = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(
+            tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        )
+    return digest.hexdigest()
 
 
 class GaussianPredictor(nn.Module):
@@ -119,9 +139,32 @@ class GaussianPredictor(nn.Module):
             self.latent_dim = args.vae.latent_dim
             self.num_latents = args.vae.num_latents
             vae_checkpoint = None
+            self.vae_state_sha256 = None
             decoder_num_queries = args.vae.get(
                 "decoder_num_queries", None
             )
+            self.decoder_num_queries = (
+                int(decoder_num_queries)
+                if decoder_num_queries is not None
+                else None
+            )
+            self.requires_decoder_queries = (
+                self.decoder_num_queries is not None
+            )
+            self.decoder_query_strategy = str(
+                args.vae.get(
+                    "decoder_query_strategy", "previous_frame"
+                )
+            )
+            if (
+                self.requires_decoder_queries
+                and self.decoder_query_strategy != "previous_frame"
+            ):
+                raise ValueError(
+                    "Only the causal 'previous_frame' decoder-query "
+                    "strategy is implemented, got "
+                    f"{self.decoder_query_strategy!r}"
+                )
             if args.vae.get("pretrained_path"):
                 if not os.path.isfile(args.vae.pretrained_path):
                     raise FileNotFoundError(
@@ -135,18 +178,19 @@ class GaussianPredictor(nn.Module):
                     map_location="cpu",
                     weights_only=False,
                 )
-                if vae_checkpoint.get("format_version") != 5:
+                if vae_checkpoint.get("format_version") != 6:
                     raise ValueError(
-                        "The VAE checkpoint predates the paper-aligned "
-                        "2,048-to-512 token format and "
+                        "The VAE checkpoint predates the public-repository "
+                        "2,048-query decoder contract and "
                         "cannot be reused. "
                         "Retrain the VAE before training or running the DiT."
                     )
                 expected_vae = {
-                    "spec_version": 5,
+                    "spec_version": 6,
                     "representation": "gaussian_vae",
                     "latent_query_source": "fps_2048_to_512",
                     "latent_interface": "token_sequence_v1",
+                    "encoder_cross_attention_depth": 1,
                     "model_dim": int(args.vae.model_dim),
                     "depth": int(args.vae.vae_depth),
                     "num_inputs": int(
@@ -159,6 +203,11 @@ class GaussianPredictor(nn.Module):
                         if decoder_num_queries is not None
                         else None
                     ),
+                    "decoder_query_source": (
+                        "input_gaussians"
+                        if decoder_num_queries is not None
+                        else None
+                    ),
                     "use_kl": bool(args.vae.use_kl),
                     "output_dim": self.gaussian_feature_dim,
                     "min_scale": float(args.vae.min_scale),
@@ -167,9 +216,12 @@ class GaussianPredictor(nn.Module):
                 if actual_vae != expected_vae:
                     raise ValueError(
                         "VAE checkpoint architecture does not match the "
-                        "configured paper-aligned model. Expected "
+                        "configured source-aligned model. Expected "
                         f"{expected_vae}, got {actual_vae}."
                     )
+                self.vae_state_sha256 = state_dict_sha256(
+                    vae_checkpoint["model"]
+                )
             self.vae = create_autoencoder(
                 depth=args.vae.vae_depth,
                 dim=args.vae.model_dim,
@@ -278,11 +330,52 @@ class GaussianPredictor(nn.Module):
         return encoded.view(B, T, encoded.shape[1], encoded.shape[2])
 
     @torch.no_grad()
-    def decode_latents(self, latents):
-        """VAE decoder stage: ``[B,(T),512,64]`` tokens -> Gaussians.
+    def prepare_decoder_queries(self, points):
+        """FPS raw Gaussians to the public decoder's query cardinality."""
+        if not self.uses_gaussian_tokens:
+            raise RuntimeError("Gaussian VAE tokens are disabled")
+        if not self.requires_decoder_queries:
+            raise RuntimeError(
+                "The configured latent-token decoder does not use queries"
+            )
+        squeeze_time = points.ndim == 3
+        if squeeze_time:
+            points = points.unsqueeze(1)
+        if points.ndim != 4 or points.shape[-1] != self.gaussian_feature_dim:
+            raise ValueError(
+                "Expected Gaussian query sources [B,N,14] or [B,T,N,14], "
+                f"got {tuple(points.shape)}"
+            )
+        batch, time_steps, num_points, channels = points.shape
+        if num_points < self.decoder_num_queries:
+            raise ValueError(
+                f"Need at least {self.decoder_num_queries} query-source "
+                f"Gaussians, got {num_points}"
+            )
+        sampled, _ = sample_farthest_gaussians(
+            points.reshape(
+                batch * time_steps, num_points, channels
+            ).float(),
+            self.decoder_num_queries,
+        )
+        sampled = sampled.view(
+            batch,
+            time_steps,
+            self.decoder_num_queries,
+            self.gaussian_feature_dim,
+        )
+        return sampled[:, 0] if squeeze_time else sampled
+
+    @torch.no_grad()
+    def decode_latents(self, latents, queries=None):
+        """Decode latent tokens, optionally through upstream Gaussian queries.
 
         The decoder is intentionally applied only after latent-DiT sampling;
         EDM steps and autoregressive context remain in latent space.
+
+        With ``decoder_num_queries=2048`` this follows the public repository:
+        ``[512,64]`` latents cross-attend from ``[2048,14]`` Gaussian queries
+        and produce ``[2048,14]`` reconstructed Gaussians.
         """
         if not self.uses_gaussian_tokens:
             raise RuntimeError("Gaussian VAE tokens are disabled")
@@ -301,8 +394,44 @@ class GaussianPredictor(nn.Module):
                 f"Expected VAE latents [*,*,{expected[0]},{expected[1]}], "
                 f"got {tuple(latents.shape)}"
             )
+        flat_queries = None
+        if self.requires_decoder_queries:
+            if queries is None:
+                raise ValueError(
+                    "The public-repository VAE decoder requires Gaussian "
+                    "queries. Use prepare_decoder_queries() on a causal "
+                    "query source and pass the result to decode_latents()."
+                )
+            if squeeze_time and queries.ndim == 3:
+                queries = queries.unsqueeze(1)
+            if queries.ndim != 4:
+                raise ValueError(
+                    "Expected decoder queries [B,Q,14] or [B,T,Q,14], "
+                    f"got {tuple(queries.shape)}"
+                )
+            expected_queries = (
+                batch,
+                time_steps,
+                self.decoder_num_queries,
+                self.gaussian_feature_dim,
+            )
+            if tuple(queries.shape) != expected_queries:
+                raise ValueError(
+                    f"Expected decoder queries {expected_queries}, got "
+                    f"{tuple(queries.shape)}"
+                )
+            flat_queries = queries.reshape(
+                batch * time_steps,
+                self.decoder_num_queries,
+                self.gaussian_feature_dim,
+            ).float()
+        elif queries is not None:
+            raise ValueError(
+                "The configured latent-token decoder does not accept queries"
+            )
         decoded = self.vae.decode(
-            latents.reshape(batch * time_steps, num_tokens, channels)
+            latents.reshape(batch * time_steps, num_tokens, channels),
+            queries=flat_queries,
         ).float()
         decoded = decoded.view(
             batch, time_steps, decoded.shape[1], decoded.shape[2]
@@ -317,10 +446,13 @@ class GaussianPredictor(nn.Module):
         return self.diffusion_sampler.sample(context_latents, action)[0]
 
     @torch.no_grad()
-    def predict_next_gaussians(self, context_latents, action):
+    def predict_next_gaussians(
+        self, context_latents, action, decoder_queries=None
+    ):
         """Run DiT, then VAE-decode its final latent prediction."""
         return self.decode_latents(
-            self.sample_next_latents(context_latents, action)
+            self.sample_next_latents(context_latents, action),
+            queries=decoder_queries,
         )
 
     def _process_obs(self, obs):
@@ -430,6 +562,10 @@ class GaussianPredictor(nn.Module):
     
     @torch.no_grad()
     def rollout(self, obs, policy, horizon):
+        if horizon <= 0:
+            raise ValueError(
+                f"rollout horizon must be positive, got {horizon}"
+            )
         self.model.eval()
         args = self.args
 
@@ -482,7 +618,7 @@ class GaussianPredictor(nn.Module):
 
         if args.observation.use_gs:
             # Preserve the legacy raw-Gaussian grid rollout for configurations
-            # that explicitly disable the VAE.  The paper-aligned default
+            # that explicitly disable the VAE. The Gaussian-token default
             # above remains the direct token path.
             assert Ctot % args.context_length == 0
             frames_img = [
@@ -558,7 +694,7 @@ class GaussianPredictor(nn.Module):
         model_to_save = self.module if isinstance(self, DDP) else self
         checkpoint = {
             "model": model_to_save.model.state_dict(),
-            "format_version": 5,
+            "format_version": 6,
             "architecture": model_to_save._architecture_metadata(),
         }
         if model_to_save.args.reward.use_reward_model:
@@ -593,7 +729,7 @@ class GaussianPredictor(nn.Module):
         if architecture != expected_architecture:
             raise ValueError(
                 "DiT checkpoint architecture does not match the configured "
-                "paper-aligned model. Expected "
+                "source-aligned model. Expected "
                 f"{expected_architecture}, got {architecture}. "
                 "Legacy 2D-grid checkpoints must be retrained."
             )
@@ -613,9 +749,9 @@ class GaussianPredictor(nn.Module):
 
     def _architecture_metadata(self):
         return {
-            "spec_version": 5,
+            "spec_version": 6,
             "vae_spec_version": (
-                5 if self.args.observation.use_gs and self.args.vae.use_vae
+                6 if self.args.observation.use_gs and self.args.vae.use_vae
                 else None
             ),
             "representation": (
@@ -630,6 +766,27 @@ class GaussianPredictor(nn.Module):
             ),
             "latent_dim": (
                 int(self.args.vae.latent_dim)
+                if self.args.vae.use_vae
+                else None
+            ),
+            "decoder_num_queries": (
+                int(self.args.vae.decoder_num_queries)
+                if (
+                    self.args.vae.use_vae
+                    and self.args.vae.get("decoder_num_queries") is not None
+                )
+                else None
+            ),
+            "decoder_query_strategy": (
+                self.decoder_query_strategy
+                if (
+                    self.args.vae.use_vae
+                    and self.args.vae.get("decoder_num_queries") is not None
+                )
+                else None
+            ),
+            "vae_state_sha256": (
+                self.vae_state_sha256
                 if self.args.vae.use_vae
                 else None
             ),

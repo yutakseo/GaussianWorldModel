@@ -5,6 +5,7 @@ import logging
 import hashlib
 import wandb
 import math
+import sys
 from pathlib import Path
 from typing import Iterable
 import numpy as np
@@ -159,6 +160,164 @@ class GaussianFeatureCache:
             self._entry_count += 1
 
 
+class LegacyGaussianBatchCache:
+    """Read version-4 batch caches as an immutable sequence collection.
+
+    Version 4 stored two 12-frame sequences in each ``batch_*.pt`` file.
+    Mapping a new DataLoader batch directly to the same file index is wrong
+    when the new batch size differs. This adapter indexes the cached sequence
+    stream explicitly and can therefore split a legacy file safely.
+    """
+
+    VERSION = 4
+
+    def __init__(
+        self,
+        cache_dir,
+        split,
+        segment_length,
+        point_cloud_size,
+        feature_dim=14,
+    ):
+        self.enabled = cache_dir is not None
+        self.segment_length = int(segment_length)
+        self.point_cloud_size = int(point_cloud_size)
+        self.feature_dim = int(feature_dim)
+        self.cache_dir = (
+            Path(cache_dir) / split if self.enabled else None
+        )
+        self.files = []
+        self.sequences_per_full_file = 0
+        self.num_sequences = 0
+        self._loaded_file_index = None
+        self._loaded_payload = None
+        if not self.enabled:
+            return
+        if self.segment_length <= 0:
+            raise ValueError("segment_length must be positive")
+        if not self.cache_dir.is_dir():
+            raise FileNotFoundError(
+                f"Legacy Gaussian cache split not found: {self.cache_dir}"
+            )
+
+        self.files = sorted(self.cache_dir.glob("batch_*.pt"))
+        if not self.files:
+            raise FileNotFoundError(
+                f"No legacy batch cache files found in {self.cache_dir}"
+            )
+        indices = [
+            int(path.stem.removeprefix("batch_")) for path in self.files
+        ]
+        expected_indices = list(range(len(self.files)))
+        if indices != expected_indices:
+            raise ValueError(
+                "Legacy cache files must be contiguous from batch_000000.pt"
+            )
+
+        first = self._load_file(0)
+        first_frames = first[0].shape[0]
+        if first_frames % self.segment_length:
+            raise ValueError(
+                "Legacy cache frame count is not divisible by segment "
+                f"length: {first_frames} vs {self.segment_length}"
+            )
+        self.sequences_per_full_file = (
+            first_frames // self.segment_length
+        )
+        if self.sequences_per_full_file <= 0:
+            raise ValueError("Legacy cache contains no complete sequence")
+
+        last = self._load_file(len(self.files) - 1)
+        last_frames = last[0].shape[0]
+        if (
+            last_frames % self.segment_length
+            or last_frames > first_frames
+        ):
+            raise ValueError(
+                f"Malformed final legacy cache file with {last_frames} frames"
+            )
+        self.num_sequences = (
+            (len(self.files) - 1) * self.sequences_per_full_file
+            + last_frames // self.segment_length
+        )
+        self._loaded_file_index = None
+        self._loaded_payload = None
+
+    def _validate_payload(self, path, payload):
+        if not isinstance(payload, dict) or payload.get("version") != self.VERSION:
+            raise ValueError(
+                f"Expected legacy cache version {self.VERSION}: {path}"
+            )
+        points = payload.get("points")
+        intrinsics = payload.get("intrinsics")
+        if (
+            not isinstance(points, torch.Tensor)
+            or not isinstance(intrinsics, torch.Tensor)
+            or points.ndim != 3
+            or tuple(points.shape[1:])
+            != (self.point_cloud_size, self.feature_dim)
+            or intrinsics.ndim != 3
+            or tuple(intrinsics.shape[1:]) != (3, 3)
+            or points.shape[0] != intrinsics.shape[0]
+        ):
+            raise ValueError(
+                f"Malformed legacy cache payload in {path}: "
+                f"points={getattr(points, 'shape', None)}, "
+                f"intrinsics={getattr(intrinsics, 'shape', None)}"
+            )
+        return points, intrinsics
+
+    def _load_file(self, file_index):
+        if self._loaded_file_index == file_index:
+            return self._loaded_payload
+        path = self.files[file_index]
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        validated = self._validate_payload(path, payload)
+        self._loaded_file_index = file_index
+        self._loaded_payload = validated
+        return validated
+
+    def load_sequences(self, sequence_start, sequence_count):
+        """Load a contiguous sequence range, splitting files as needed."""
+        if not self.enabled:
+            return None
+        sequence_start = int(sequence_start)
+        sequence_count = int(sequence_count)
+        if sequence_start < 0 or sequence_count <= 0:
+            raise ValueError("Invalid legacy sequence range")
+        sequence_end = sequence_start + sequence_count
+        if sequence_end > self.num_sequences:
+            raise IndexError(
+                f"Legacy cache has {self.num_sequences} sequences, requested "
+                f"[{sequence_start}, {sequence_end})"
+            )
+
+        point_chunks = []
+        intrinsics_chunks = []
+        cursor = sequence_start
+        while cursor < sequence_end:
+            file_index = cursor // self.sequences_per_full_file
+            sequence_in_file = (
+                cursor % self.sequences_per_full_file
+            )
+            points, intrinsics = self._load_file(file_index)
+            available = (
+                points.shape[0] // self.segment_length
+                - sequence_in_file
+            )
+            take = min(available, sequence_end - cursor)
+            frame_start = sequence_in_file * self.segment_length
+            frame_end = frame_start + take * self.segment_length
+            point_chunks.append(points[frame_start:frame_end])
+            intrinsics_chunks.append(intrinsics[frame_start:frame_end])
+            cursor += take
+
+        return (
+            torch.cat(point_chunks, dim=0),
+            torch.cat(intrinsics_chunks, dim=0),
+        )
+
+
 def load_or_compute_gaussian_batch(images, cache, splatt3r, device, cfg):
     """Return cached or frozen-Splatt3R VAE inputs for a BTHWC RGB batch.
 
@@ -242,16 +401,17 @@ def load_or_compute_gaussian_batch(images, cache, splatt3r, device, cfg):
 
 
 def vae_reconstruction_loss(model, points, intrinsics, image_size, cfg):
-    """Paper Eq. (4): center Chamfer plus differentiable rendering L1."""
-    encoded = model.encode(points)
-    if isinstance(encoded, tuple):
-        kl, latents = encoded
-        loss_kl = kl.sum() / kl.shape[0]
-    else:
-        latents = encoded
-        loss_kl = None
-
-    reconstructed = model.decode(latents).float()
+    """Use upstream input queries with the paper's reconstruction losses."""
+    decoder_queries = (
+        points
+        if cfg.vae.get("decoder_num_queries", None) is not None
+        else None
+    )
+    outputs = model(points, decoder_queries)
+    reconstructed = outputs["logits"].float()
+    loss_kl = outputs.get("kl")
+    if loss_kl is not None:
+        loss_kl = loss_kl.sum() / loss_kl.shape[0]
     targets = points.float()
     loss_chamfer, _ = chamfer_distance(
         reconstructed[..., :3],
@@ -294,6 +454,24 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         cfg.gaussian_cache.dtype,
         max_entries=cfg.gaussian_cache.get("max_entries", None),
     )
+    legacy_cache = LegacyGaussianBatchCache(
+        cfg.gaussian_cache.get("legacy_batch_dir", None),
+        split="train",
+        segment_length=cfg.dataset.segment_length,
+        point_cloud_size=cfg.vae.point_cloud_size,
+    )
+    if legacy_cache.enabled:
+        expected_sequences = len(data_loader.dataset)
+        if legacy_cache.num_sequences < expected_sequences:
+            raise ValueError(
+                "Legacy train cache is incomplete: "
+                f"{legacy_cache.num_sequences} < {expected_sequences}"
+            )
+        cprint(
+            "[Gaussian cache] read-only v4 sequence adapter: "
+            f"{legacy_cache.num_sequences} train sequences",
+            "cyan",
+        )
     accum_iter = cfg.train.accum_iter
     optimizer.zero_grad()
 
@@ -310,11 +488,21 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         if data_iter_step >= max_batches:
             break
 
-        points, intrinsics, image_size, splatt3r = (
-            load_or_compute_gaussian_batch(
-                batch[0], cache, splatt3r, device, cfg
+        if legacy_cache.enabled:
+            current_batch_size = batch[0].shape[0]
+            sequence_start = data_iter_step * cfg.train.batch_size
+            points, intrinsics = legacy_cache.load_sequences(
+                sequence_start, current_batch_size
             )
-        )
+            image_size = tuple(batch[0].shape[2:4])
+            points = points.to(device, non_blocking=True)
+            intrinsics = intrinsics.to(device, non_blocking=True)
+        else:
+            points, intrinsics, image_size, splatt3r = (
+                load_or_compute_gaussian_batch(
+                    batch[0], cache, splatt3r, device, cfg
+                )
+            )
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             loss, loss_chamfer, loss_render, loss_kl = (
@@ -371,6 +559,24 @@ def evaluate(model, data_loader, device, cfg, split="val"):
         split=split,
         max_entries=cfg.gaussian_cache.get("max_entries", None),
     )
+    legacy_cache = LegacyGaussianBatchCache(
+        cfg.gaussian_cache.get("legacy_batch_dir", None),
+        split=split,
+        segment_length=cfg.dataset.segment_length,
+        point_cloud_size=cfg.vae.point_cloud_size,
+    )
+    if legacy_cache.enabled:
+        expected_sequences = len(data_loader.dataset)
+        if legacy_cache.num_sequences < expected_sequences:
+            raise ValueError(
+                f"Legacy {split} cache is incomplete: "
+                f"{legacy_cache.num_sequences} < {expected_sequences}"
+            )
+        cprint(
+            "[Gaussian cache] read-only v4 sequence adapter: "
+            f"{legacy_cache.num_sequences} {split} sequences",
+            "cyan",
+        )
 
     metric_logger = distributed_utils.MetricLogger(delimiter="  ")
     header = 'Eval:'
@@ -383,11 +589,21 @@ def evaluate(model, data_loader, device, cfg, split="val"):
             and batch_index >= cfg.train.max_eval_batches
         ):
             break
-        points, intrinsics, image_size, splatt3r = (
-            load_or_compute_gaussian_batch(
-                batch[0], cache, splatt3r, device, cfg
+        if legacy_cache.enabled:
+            current_batch_size = batch[0].shape[0]
+            sequence_start = batch_index * cfg.train.batch_size
+            points, intrinsics = legacy_cache.load_sequences(
+                sequence_start, current_batch_size
             )
-        )
+            image_size = tuple(batch[0].shape[2:4])
+            points = points.to(device, non_blocking=True)
+            intrinsics = intrinsics.to(device, non_blocking=True)
+        else:
+            points, intrinsics, image_size, splatt3r = (
+                load_or_compute_gaussian_batch(
+                    batch[0], cache, splatt3r, device, cfg
+                )
+            )
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             loss, loss_chamfer, loss_render, loss_kl = (

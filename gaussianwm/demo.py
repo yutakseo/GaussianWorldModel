@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig
+from pytorch3d.loss import chamfer_distance
 from termcolor import cprint
 
 from gaussianwm.gwm_predictor import GaussianPredictor
@@ -50,12 +51,14 @@ def save_rollout_video(
     cprint(f"Saved rollout video to {save_path.absolute()}", 'green')
 
 
-def decode_gaussians(model, latent):
+def decode_gaussians(model, latent, decoder_queries=None):
     """Convert one token or legacy grid frame into Gaussian parameters."""
     if model.uses_gaussian_tokens:
         if latent.ndim == 2:
             latent = latent.unsqueeze(0)
-        return model.decode_latents(latent).float()
+        return model.decode_latents(
+            latent, queries=decoder_queries
+        ).float()
     if latent.ndim == 3:
         return latent.permute(1, 2, 0).reshape(1, -1, latent.shape[0]).float()
     if latent.ndim == 4:
@@ -79,9 +82,13 @@ def render_gaussian_tensor(gaussians, image_size, intrinsics):
     ).astype(np.uint8)
 
 
-def gaussian_rasterize_preview(model, latent, image_size, intrinsics):
+def gaussian_rasterize_preview(
+    model, latent, image_size, intrinsics, decoder_queries=None
+):
     """Decode and rasterize Gaussian parameters from the first-camera frame."""
-    decoded = decode_gaussians(model, latent)
+    decoded = decode_gaussians(
+        model, latent, decoder_queries=decoder_queries
+    )
     expected_dim = sum(
         width
         for name, width in gaussian_feature_to_dim.items()
@@ -96,13 +103,19 @@ def gaussian_rasterize_preview(model, latent, image_size, intrinsics):
     return render_gaussian_tensor(decoded, image_size, intrinsics)
 
 
-def gaussian_preview(model, latent, image_size, intrinsics=None):
+def gaussian_preview(
+    model, latent, image_size, intrinsics=None, decoder_queries=None
+):
     """Backward-compatible alias for the real Gaussian rasterization path."""
     if model.args.observation.use_gs:
         if intrinsics is None:
             raise ValueError("Gaussian rendering requires calibrated intrinsics")
         return gaussian_rasterize_preview(
-            model, latent, image_size, intrinsics
+            model,
+            latent,
+            image_size,
+            intrinsics,
+            decoder_queries=decoder_queries,
         )
     else:
         rgb = latent[:3]
@@ -182,12 +195,32 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
                 )
                 frames = [gt_latents[:, t] for t in range(context_length)]
                 predicted = []
+                predicted_gaussians = []
+                decoder_query_state = None
+                if (
+                    model.uses_gaussian_tokens
+                    and model.requires_decoder_queries
+                ):
+                    # The public VAE was trained with input Gaussians as
+                    # decoder queries. At rollout time future inputs do not
+                    # exist, so seed from the last observation and then feed
+                    # back only predictions.
+                    decoder_query_state = model.prepare_decoder_queries(
+                        raw_gaussians[:, context_length - 1]
+                    )
                 for t in range(obs.shape[1] - context_length):
                     ctx = torch.stack(frames[-context_length:], dim=1)
                     if model.uses_gaussian_tokens:
                         next_latent = model.sample_next_latents(
                             ctx, replay_policy(None, t)
                         )
+                        if model.requires_decoder_queries:
+                            next_gaussians = model.decode_latents(
+                                next_latent,
+                                queries=decoder_query_state,
+                            )
+                            predicted_gaussians.append(next_gaussians)
+                            decoder_query_state = next_gaussians.detach()
                     else:
                         next_latent = model.diffusion_sampler.sample(
                             ctx, replay_policy(None, t)
@@ -225,45 +258,110 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             vae_frames = []
             pred_frames = []
 
+            target_decoder_queries = None
+            if (
+                model.uses_gaussian_tokens
+                and model.requires_decoder_queries
+            ):
+                target_decoder_queries = model.prepare_decoder_queries(
+                    raw_gaussians[:, context_length:]
+                )
             decoded_targets = (
-                model.decode_latents(target_obs)
+                model.decode_latents(
+                    target_obs,
+                    queries=target_decoder_queries,
+                )
                 if model.uses_gaussian_tokens
                 else None
             )
             decoded_predictions = (
-                model.decode_latents(rollout_obs)
+                (
+                    torch.stack(predicted_gaussians, dim=1)
+                    if model.requires_decoder_queries
+                    else model.decode_latents(rollout_obs)
+                )
                 if model.uses_gaussian_tokens
                 else None
             )
-            
+
+            if (
+                model.uses_gaussian_tokens
+                and model.requires_decoder_queries
+            ):
+                target_gaussians = target_decoder_queries
+                pred_flat = decoded_predictions.flatten(0, 1)
+                vae_flat = decoded_targets.flatten(0, 1)
+                target_flat = target_gaussians.flatten(0, 1)
+                prediction_chamfer, _ = chamfer_distance(
+                    pred_flat[..., :3],
+                    target_flat[..., :3],
+                    batch_reduction="mean",
+                    point_reduction="mean",
+                )
+                vae_chamfer, _ = chamfer_distance(
+                    vae_flat[..., :3],
+                    target_flat[..., :3],
+                    batch_reduction="mean",
+                    point_reduction="mean",
+                )
+                metrics_summary[-1]["prediction_center_chamfer"] = (
+                    prediction_chamfer.item()
+                )
+                metrics_summary[-1]["vae_center_chamfer"] = (
+                    vae_chamfer.item()
+                )
+                cprint(
+                    "Prediction center Chamfer: "
+                    f"{prediction_chamfer.item():.6f}",
+                    "magenta",
+                )
+                cprint(
+                    f"VAE center Chamfer: {vae_chamfer.item():.6f}",
+                    "magenta",
+                )
+
+            rollout_intrinsics = None
+            if cfg.world_model.observation.use_gs:
+                # Camera calibration is part of the observed context. Never
+                # estimate it from a future target frame during inference.
+                rollout_intrinsics = estimate_intrinsics_from_gaussians(
+                    raw_gaussians[0, context_length - 1],
+                    obs.shape[-2:],
+                )
+
             for t in range(rollout_obs.shape[1]):
                 gt_frame = obs[0, context_length + t].cpu().numpy().transpose(1,2,0).astype(np.uint8)
                 gt_frame = np.ascontiguousarray(gt_frame)
                 if cfg.world_model.observation.use_gs:
                     source_gaussians = raw_gaussians[0, context_length + t]
-                    intrinsics = estimate_intrinsics_from_gaussians(
-                        source_gaussians, gt_frame.shape[:2]
-                    )
                     source_frame = render_gaussian_tensor(
-                        source_gaussians, gt_frame.shape[:2], intrinsics
+                        source_gaussians,
+                        gt_frame.shape[:2],
+                        rollout_intrinsics,
                     )
                     if model.uses_gaussian_tokens:
                         vae_frame = render_gaussian_tensor(
                             decoded_targets[0, t],
                             gt_frame.shape[:2],
-                            intrinsics,
+                            rollout_intrinsics,
                         )
                         pred_frame = render_gaussian_tensor(
                             decoded_predictions[0, t],
                             gt_frame.shape[:2],
-                            intrinsics,
+                            rollout_intrinsics,
                         )
                     else:
                         vae_frame = gaussian_preview(
-                            model, target_obs[0, t], gt_frame.shape[:2], intrinsics
+                            model,
+                            target_obs[0, t],
+                            gt_frame.shape[:2],
+                            rollout_intrinsics,
                         )
                         pred_frame = gaussian_preview(
-                            model, rollout_obs[0, t], gt_frame.shape[:2], intrinsics
+                            model,
+                            rollout_obs[0, t],
+                            gt_frame.shape[:2],
+                            rollout_intrinsics,
                         )
                 else:
                     source_frame = gt_frame
@@ -367,6 +465,10 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
         avg_source_rendered_mse = np.mean(
             [m["source_rendered_rgb_mse"] for m in metrics_summary]
         )
+        has_center_metrics = all(
+            "prediction_center_chamfer" in metric
+            for metric in metrics_summary
+        )
 
         summary = {
             'num_samples': len(metrics_summary),
@@ -377,6 +479,23 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             'average_inference_time': avg_time,
             'per_sample_metrics': metrics_summary
         }
+        if has_center_metrics:
+            summary["average_prediction_center_chamfer"] = float(
+                np.mean(
+                    [
+                        metric["prediction_center_chamfer"]
+                        for metric in metrics_summary
+                    ]
+                )
+            )
+            summary["average_vae_center_chamfer"] = float(
+                np.mean(
+                    [
+                        metric["vae_center_chamfer"]
+                        for metric in metrics_summary
+                    ]
+                )
+            )
         summary_path = output_dir / "metrics_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
@@ -393,6 +512,17 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
         cprint(
             f"Average rendered RGB MSE: {avg_rendered_mse:.6f}", "blue"
         )
+        if has_center_metrics:
+            cprint(
+                "Average prediction center Chamfer: "
+                f"{summary['average_prediction_center_chamfer']:.6f}",
+                "blue",
+            )
+            cprint(
+                "Average VAE center Chamfer: "
+                f"{summary['average_vae_center_chamfer']:.6f}",
+                "blue",
+            )
         cprint(f"Average inference time: {avg_time:.3f}s", 'blue')
         cprint(f"Metrics summary saved to {summary_path.absolute()}", 'green')
     

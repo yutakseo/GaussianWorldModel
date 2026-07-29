@@ -1,17 +1,18 @@
 # Configuration for Autoencoder models
 
 # Default model parameters
-name: gaussian_vae_d64_m512
+name: gaussian_vae_upstream_q2048_m512_d64
 point_cloud_size: 2048
 
 use_vae: true
 vae_depth: 4
-model_dim: 512
+model_dim: 64
 # Paper Appendix B.2: 2,048 input Gaussians are reduced to 512 latents.
 num_latents: 512
 latent_dim: 64
-# The paper's mirrored decoder reconstructs one Gaussian per latent point.
-decoder_num_queries: null
+# Public code trains with model(points, points): the 2,048 inputs are decoder
+# queries, so the reconstruction also contains 2,048 Gaussians.
+decoder_num_queries: 2048
 output_dim: 14
 use_kl: true
 min_scale: 1.0e-5

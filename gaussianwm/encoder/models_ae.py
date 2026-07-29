@@ -11,7 +11,8 @@ from einops import rearrange, repeat
 # from torch_cluster import fps
 from pytorch3d.ops import sample_farthest_points as fps
 
-from timm.models.layers import DropPath
+from timm.layers import DropPath
+
 
 def exists(val):
     return val is not None
@@ -156,12 +157,11 @@ class DiagonalGaussianDistribution(object):
             self.var = self.std = torch.zeros_like(self.mean).to(device=self.mean.device)
 
     def sample(self):
-        x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.mean.device)
-        return x
+        return self.mean + self.std * torch.randn_like(self.mean)
 
     def kl(self, other=None):
         if self.deterministic:
-            return torch.Tensor([0.])
+            return self.mean.new_zeros(self.mean.shape[0])
         else:
             if other is None:
                 return 0.5 * torch.mean(torch.pow(self.mean, 2)
@@ -171,11 +171,13 @@ class DiagonalGaussianDistribution(object):
                 return 0.5 * torch.mean(
                     torch.pow(self.mean - other.mean, 2) / other.var
                     + self.var / other.var - 1.0 - self.logvar + other.logvar,
-                    dim=[1, 2, 3])
+                    dim=tuple(range(1, self.mean.ndim)))
 
-    def nll(self, sample, dims=[1,2,3]):
+    def nll(self, sample, dims=None):
         if self.deterministic:
-            return torch.Tensor([0.])
+            return self.mean.new_zeros(self.mean.shape[0])
+        if dims is None:
+            dims = tuple(range(1, sample.ndim))
         logtwopi = np.log(2.0 * np.pi)
         return 0.5 * torch.sum(
             logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
@@ -199,7 +201,8 @@ class GaussianOutputTransform(nn.Module):
         rotations = raw[..., 6:10]
         rotation_norm = rotations.norm(dim=-1, keepdim=True)
         identity = torch.zeros_like(rotations)
-        identity[..., 0] = 1.0
+        # Splatt3R and the renderer use scipy's XYZW quaternion order.
+        identity[..., 3] = 1.0
         rotations = torch.where(
             rotation_norm > 1.0e-8,
             rotations / rotation_norm.clamp_min(1.0e-8),
@@ -222,9 +225,37 @@ def initialize_gaussian_output(
         layer.bias.zero_()
         scale = max(float(initial_scale) - 1.0e-5, 1.0e-8)
         layer.bias[3:6] = np.log(np.expm1(scale))
-        layer.bias[6] = 1.0
+        # Rotation channels are XYZW, so identity is [0, 0, 0, 1].
+        layer.bias[9] = 1.0
         opacity = min(max(float(initial_opacity), 1.0e-5), 1.0 - 1.0e-5)
         layer.bias[13] = np.log(opacity / (1.0 - opacity))
+
+
+def sample_farthest_gaussians(gaussians, num_samples):
+    """FPS Gaussian primitives by their 3D centers and gather all channels."""
+    if gaussians.ndim != 3 or gaussians.shape[-1] < 3:
+        raise ValueError(
+            "Expected Gaussian features with shape [B,N,D>=3], got "
+            f"{tuple(gaussians.shape)}"
+        )
+    num_samples = int(num_samples)
+    if not 0 < num_samples <= gaussians.shape[1]:
+        raise ValueError(
+            f"num_samples must be in [1, {gaussians.shape[1]}], "
+            f"got {num_samples}"
+        )
+    centers = gaussians[..., :3].float()
+    if not torch.isfinite(centers).all():
+        raise ValueError("Gaussian centers contain NaN or infinite values")
+    _, sampled_indices = fps(centers, K=num_samples)
+    sampled = torch.gather(
+        gaussians,
+        1,
+        sampled_indices.unsqueeze(-1).expand(
+            -1, -1, gaussians.shape[-1]
+        ),
+    )
+    return sampled, sampled_indices
 
 
 class AutoEncoder(nn.Module):
@@ -250,25 +281,34 @@ class AutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
-        self.decoder_num_queries = (
-            num_latents
-            if decoder_num_queries is None
-            else int(decoder_num_queries)
-        )
-        if self.decoder_num_queries <= 0:
-            raise ValueError("decoder_num_queries must be positive")
-        self.decoder_queries = (
-            nn.Parameter(torch.randn(self.decoder_num_queries, queries_dim) * 0.02)
-            if self.decoder_num_queries != self.num_latents
-            else None
-        )
+        if decoder_num_queries is not None:
+            raise ValueError(
+                "The paper-aligned self-attention decoder emits one "
+                "Gaussian per latent and does not support separate decoder "
+                f"queries ({decoder_num_queries} requested)."
+            )
+        self.decoder_num_queries = self.num_latents
 
-        self.cross_attend_blocks = nn.ModuleList([
-            PreNorm(dim, Attention(dim, dim, heads = 1, dim_head = dim), context_dim = dim),
-            PreNorm(dim, FeedForward(dim))
-        ])
+        self.encoder_layers = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        PreNorm(
+                            dim,
+                            Attention(
+                                dim, dim, heads=1, dim_head=dim
+                            ),
+                            context_dim=dim,
+                        ),
+                        PreNorm(dim, FeedForward(dim)),
+                    ]
+                )
+                for _ in range(depth)
+            ]
+        )
 
         self.point_embed = PointEmbed(dim=dim)
+        self.encoder_norm = nn.LayerNorm(dim)
 
         get_latent_attn = lambda: PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, drop_path_rate=0.1))
         get_latent_ff = lambda: PreNorm(dim, FeedForward(dim, drop_path_rate=0.1))
@@ -283,8 +323,8 @@ class AutoEncoder(nn.Module):
                 get_latent_ff(**cache_args)
             ]))
 
-        self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, dim, heads = 1, dim_head = dim), context_dim = dim)
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
+        self.decoder_norm = nn.LayerNorm(queries_dim)
 
         self.to_outputs = nn.Linear(queries_dim, output_dim) if exists(output_dim) else nn.Identity()
         self.output_transform = (
@@ -300,9 +340,9 @@ class AutoEncoder(nn.Module):
         assert N == self.num_inputs, f"Expected {self.num_inputs} point cloud inputs, got {N}"
 
         ###### FPS sampling based on XYZ coordinates
-        _, sampled_indices = fps(pc[..., :3], K=self.num_latents)
-        sampled_pc = torch.gather(pc, 1, 
-            sampled_indices.unsqueeze(-1).expand(-1,-1,D))  # [B, K, 14], e.g., []
+        sampled_pc, _ = sample_farthest_gaussians(
+            pc, self.num_latents
+        )
 
         # print(f"{sampled_pc.shape=}") # [B, K ,3], e.g., [64, 128, 3]
 
@@ -310,41 +350,35 @@ class AutoEncoder(nn.Module):
         sampled_pc_embeddings = self.point_embed(sampled_pc)  # [B, K, C]
         pc_embeddings = self.point_embed(pc)  # [B, N, C]
 
-        cross_attn, cross_ff = self.cross_attend_blocks
+        x = sampled_pc_embeddings
+        for cross_attn, cross_ff in self.encoder_layers:
+            x = cross_attn(x, context=pc_embeddings, mask=None) + x
+            x = cross_ff(x) + x
 
-        x = cross_attn(sampled_pc_embeddings, context=pc_embeddings, mask=None) + sampled_pc_embeddings
-        x = cross_ff(x) + x  # [B, K, C]
-
-        return x
+        return self.encoder_norm(x)
 
 
     def decode(self, x, queries=None):
+        if queries is not None:
+            raise ValueError(
+                "The paper-aligned decoder does not accept external queries"
+            )
 
         for self_attn, self_ff in self.layers:
             x = self_attn(x) + x
             x = self_ff(x) + x
 
-        # cross attend from decoder queries to latents
-        if queries is not None:
-            queries_embeddings = self.point_embed(queries)
-            latents = self.decoder_cross_attn(queries_embeddings, context = x)
-        elif self.decoder_queries is not None:
-            queries_embeddings = self.decoder_queries.unsqueeze(0).expand(
-                x.shape[0], -1, -1
-            )
-            latents = self.decoder_cross_attn(
-                queries_embeddings, context=x
-            )
-        else:
-            latents = x
+        latents = x
 
         # optional decoder feedforward
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)
         
-        return self.output_transform(self.to_outputs(latents))
+        return self.output_transform(
+            self.to_outputs(self.decoder_norm(latents))
+        )
 
-    def forward(self, pc, queries):
+    def forward(self, pc, queries=None):
         x = self.encode(pc)
 
         # print(f"{x.shape=}")  # [B, 128, 128]
@@ -377,25 +411,34 @@ class KLAutoEncoder(nn.Module):
 
         self.num_inputs = num_inputs
         self.num_latents = num_latents
-        self.decoder_num_queries = (
-            num_latents
-            if decoder_num_queries is None
-            else int(decoder_num_queries)
-        )
-        if self.decoder_num_queries <= 0:
-            raise ValueError("decoder_num_queries must be positive")
-        self.decoder_queries = (
-            nn.Parameter(torch.randn(self.decoder_num_queries, queries_dim) * 0.02)
-            if self.decoder_num_queries != self.num_latents
-            else None
-        )
+        if decoder_num_queries is not None:
+            raise ValueError(
+                "The paper-aligned self-attention decoder emits one "
+                "Gaussian per latent and does not support separate decoder "
+                f"queries ({decoder_num_queries} requested)."
+            )
+        self.decoder_num_queries = self.num_latents
 
-        self.cross_attend_blocks = nn.ModuleList([
-            PreNorm(dim, Attention(dim, dim, heads = 1, dim_head = dim), context_dim = dim),
-            PreNorm(dim, FeedForward(dim))
-        ])
+        self.encoder_layers = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        PreNorm(
+                            dim,
+                            Attention(
+                                dim, dim, heads=1, dim_head=dim
+                            ),
+                            context_dim=dim,
+                        ),
+                        PreNorm(dim, FeedForward(dim)),
+                    ]
+                )
+                for _ in range(depth)
+            ]
+        )
 
         self.point_embed = PointEmbed(dim=dim)
+        self.encoder_norm = nn.LayerNorm(dim)
 
         get_latent_attn = lambda: PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, drop_path_rate=0.1))
         get_latent_ff = lambda: PreNorm(dim, FeedForward(dim, drop_path_rate=0.1))
@@ -410,8 +453,8 @@ class KLAutoEncoder(nn.Module):
                 get_latent_ff(**cache_args)
             ]))
 
-        self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, dim, heads = 1, dim_head = dim), context_dim = dim)
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
+        self.decoder_norm = nn.LayerNorm(queries_dim)
 
         self.to_outputs = nn.Linear(queries_dim, output_dim) if exists(output_dim) else nn.Identity()
         self.output_transform = (
@@ -431,24 +474,19 @@ class KLAutoEncoder(nn.Module):
         B, N, D = pc.shape
         assert N == self.num_inputs
 
-        # Sample independently per batch item. The previous flattened FPS
-        # mixed points from different scenes and returned too few tokens per
-        # item whenever B > 1.
-        _, sampled_indices = fps(pc[..., :3], K=self.num_latents)
-        sampled_pc = torch.gather(
-            pc,
-            1,
-            sampled_indices.unsqueeze(-1).expand(-1, -1, D),
+        sampled_pc, _ = sample_farthest_gaussians(
+            pc, self.num_latents
         )
 
         sampled_pc_embeddings = self.point_embed(sampled_pc)
 
         pc_embeddings = self.point_embed(pc)
 
-        cross_attn, cross_ff = self.cross_attend_blocks
-
-        x = cross_attn(sampled_pc_embeddings, context = pc_embeddings, mask = None) + sampled_pc_embeddings
-        x = cross_ff(x) + x
+        x = sampled_pc_embeddings
+        for cross_attn, cross_ff in self.encoder_layers:
+            x = cross_attn(x, context=pc_embeddings, mask=None) + x
+            x = cross_ff(x) + x
+        x = self.encoder_norm(x)
 
         mean = self.mean_fc(x)
         logvar = self.logvar_fc(x)
@@ -461,6 +499,10 @@ class KLAutoEncoder(nn.Module):
 
 
     def decode(self, x, queries=None):
+        if queries is not None:
+            raise ValueError(
+                "The paper-aligned decoder does not accept external queries"
+            )
 
         x = self.proj(x)
 
@@ -468,22 +510,17 @@ class KLAutoEncoder(nn.Module):
             x = self_attn(x) + x
             x = self_ff(x) + x
 
-        # cross attend from decoder queries to latents
-        if queries is not None:
-            queries_embeddings = self.point_embed(queries)
-        elif self.decoder_queries is not None:
-            queries_embeddings = self.decoder_queries.unsqueeze(0).expand(
-                x.shape[0], -1, -1
-            )
-        else:
-            queries_embeddings = x
-        latents = self.decoder_cross_attn(queries_embeddings, context = x)
+        # Paper Eq. (3): reconstruct the latent Gaussian set through
+        # self-attention, without synthetic queries.
+        latents = x
 
         # optional decoder feedforward
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)
         
-        return self.output_transform(self.to_outputs(latents))
+        return self.output_transform(
+            self.to_outputs(self.decoder_norm(latents))
+        )
 
     def forward(self, pc, queries=None):
         kl, x = self.encode(pc)

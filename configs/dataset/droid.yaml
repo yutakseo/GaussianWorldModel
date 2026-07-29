@@ -6,7 +6,8 @@ dataset_name: droid
 data_path: ${oc.env:GWM_PATH}/data/
 
 # Dataset parameters
-segment_length: 10  # Matches horizon from config
+# Paper Table A1: 12-frame sequences, 2 context frames, 10-step rollout.
+segment_length: 12
 context_length: 2
 # segment_length: 2
 # context_length: 1
@@ -26,7 +27,8 @@ max_val_samples: null
 seed: ${seed}
 
 # Camera and action handling
-camera_keys: ["primary", "secondary"]  # Using primary and secondary cameras
+# The current DROID adaptation uses the paper-supported single-view path.
+camera_keys: ["primary"]
 action_keys: ["actions"]
 
 # DROID-specific RLDS parameters

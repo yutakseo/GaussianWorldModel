@@ -56,12 +56,9 @@ def robomimic_transform(trajectory):
     """Transform trajectory to robomimic format."""
     return {
         "obs": {
-            "camera/image/varied_camera_1_left_image": 
+            "camera/image/varied_camera_1_left_image":
                 # tf.cast(trajectory["observation"]["image_primary"], tf.float32) / 255.,
                 trajectory["observation"]["image_primary"],
-            "camera/image/varied_camera_2_left_image": 
-                # tf.cast(trajectory["observation"]["image_secondary"], tf.float32) / 255.,
-                trajectory["observation"]["image_secondary"],
             "raw_language": trajectory["task"]["language_instruction"],
             "robot_state/cartesian_position": trajectory["observation"]["proprio"][..., :6],
             "robot_state/gripper_position": trajectory["observation"]["proprio"][..., -1:],
@@ -119,8 +116,8 @@ class DroidDataset(IterableDataset):
         augment: bool = False,
         seed: int = 42,
         split: str = "train",
-        camera_keys: List[str] = ["primary", "secondary"],
-        action_keys: List[str] = ["actions"],
+        camera_keys: Optional[List[str]] = None,
+        action_keys: Optional[List[str]] = None,
         future_action_window_size: int = 15,
         subsample_length: int = 100,
         shuffle_buffer_size: int = 100000,
@@ -161,8 +158,12 @@ class DroidDataset(IterableDataset):
         self.image_size = image_size
         self.augment = augment
         self.split = split
-        self.camera_keys = camera_keys
-        self.action_keys = action_keys
+        self.camera_keys = (
+            list(camera_keys) if camera_keys is not None else ["primary"]
+        )
+        self.action_keys = (
+            list(action_keys) if action_keys is not None else ["actions"]
+        )
         self.rng = np.random.RandomState(seed)
         self.split_fractions = split_fractions or {
             "train": 0.9,
@@ -174,10 +175,27 @@ class DroidDataset(IterableDataset):
                 f"Split must be one of {tuple(self.split_fractions)}, got {split}"
             )
 
+        if "primary" not in self.camera_keys:
+            raise ValueError(
+                "The current single-view GWM pipeline requires the primary "
+                "camera"
+            )
+        camera_sources = {
+            "primary": "exterior_image_1_left",
+            "secondary": "exterior_image_2_left",
+        }
+        unknown_cameras = set(self.camera_keys) - set(camera_sources)
+        if unknown_cameras:
+            raise ValueError(
+                f"Unsupported DROID camera keys: {sorted(unknown_cameras)}"
+            )
+
         # Base dataset configuration
         BASE_DATASET_KWARGS = {
             "data_dir": data_path,
-            "image_obs_keys": {"primary": "exterior_image_1_left", "secondary": "exterior_image_2_left"},
+            "image_obs_keys": {
+                key: camera_sources[key] for key in self.camera_keys
+            },
             "state_obs_keys": ["cartesian_position", "gripper_position"],
             "language_key": "language_instruction",
             # "norm_skip_keys": ["proprio"],
@@ -271,7 +289,6 @@ class DroidDataset(IterableDataset):
             # dict_keys(['camera/image/varied_camera_1_left_image', 'camera/image/varied_camera_2_left_image', \
             # 'raw_language', 'robot_state/cartesian_position', 'robot_state/gripper_position', 'pad_mask'])
             left_frames = sample['obs']['camera/image/varied_camera_1_left_image']  # Use primary camera
-            right_frames = sample['obs']['camera/image/varied_camera_2_left_image']
             # Only the actions aligned with the observation window are used;
             # the RLDS chunk may also contain a future-action horizon.
             action = sample['actions'][:self.segment_length]
@@ -282,7 +299,6 @@ class DroidDataset(IterableDataset):
             # RLDS may expose read-only NumPy views. Copy before converting so
             # PyTorch never receives a tensor with undefined write behavior.
             left_frames = torch.from_numpy(np.array(left_frames, copy=True))
-            right_frames = torch.from_numpy(np.array(right_frames, copy=True))
             action = torch.from_numpy(np.array(action, copy=True))
             pad_mask = torch.from_numpy(
                 np.array(pad_mask, copy=True)
@@ -295,8 +311,6 @@ class DroidDataset(IterableDataset):
             # Convert to uint8 range [0, 255] if needed
             if left_frames.dtype == torch.float32 and left_frames.max() <= 1.0:
                 left_frames = (left_frames * 255).to(torch.uint8)
-            if right_frames.dtype == torch.float32 and right_frames.max() <= 1.0:
-                right_frames = (right_frames * 255).to(torch.uint8)
             # print(f"{action.shape=}, {reward.shape=}")
             # action.shape=torch.Size([16, 10]), reward.shape=torch.Size([10, 1])
             # obs = {

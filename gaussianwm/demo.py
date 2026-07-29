@@ -397,7 +397,7 @@ def main(cfg: DictConfig):
     seed_everything(cfg.seed)
     
     cprint("Creating model...", 'blue')
-    model = GaussianPredictor(cfg.world_model).to(device)
+    model = GaussianPredictor(cfg.world_model, device=device).to(device)
     
     cprint(f"Loading specific checkpoint: {checkpoint_path}", 'green')
     suffix = checkpoint_path.stem.removeprefix("model")

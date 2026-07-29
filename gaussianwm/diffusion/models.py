@@ -283,7 +283,11 @@ class DiT(nn.Module):
         
         # Handle noise level embeddings
         c_noise_emb = self.t_embedder(c_noise)                # (N, D)
-        c_noise_cond_emb = self.t_embedder_cond(c_noise_cond)      # (N, D)
+        c_noise_cond_emb = (
+            self.t_embedder_cond(c_noise_cond)
+            if c_noise_cond is not None
+            else 0
+        )
         
         # Process action embedding
         if act is not None:
@@ -445,6 +449,12 @@ class GaussianDiT(nn.Module):
         super().__init__()
         self.num_tokens = int(num_tokens)
         self.latent_channels = int(in_channels)
+        self.context_length = int(context_length)
+        self.action_dim = int(action_dim)
+        if self.num_tokens <= 0 or self.latent_channels <= 0:
+            raise ValueError("num_tokens and in_channels must be positive")
+        if self.context_length <= 0:
+            raise ValueError("context_length must be positive")
         input_channels = self.latent_channels * (context_length + 1)
         self.input_projection = nn.Linear(input_channels, hidden_size)
         self.noise_embedding = TimestepEmbedder(hidden_size)
@@ -491,14 +501,34 @@ class GaussianDiT(nn.Module):
                 f"Expected {self.num_tokens} Gaussian tokens, "
                 f"got {noisy_tokens.shape[1]}"
             )
+        if context_tokens.shape[1] != self.num_tokens:
+            raise ValueError(
+                f"Expected {self.num_tokens} context tokens, "
+                f"got {context_tokens.shape[1]}"
+            )
+        expected_context_channels = (
+            self.context_length * self.latent_channels
+        )
+        if context_tokens.shape[-1] != expected_context_channels:
+            raise ValueError(
+                f"Expected {expected_context_channels} context channels, "
+                f"got {context_tokens.shape[-1]}"
+            )
+        if noisy_tokens.shape[-1] != self.latent_channels:
+            raise ValueError(
+                f"Expected {self.latent_channels} noisy channels, "
+                f"got {noisy_tokens.shape[-1]}"
+            )
         x = self.input_projection(
             torch.cat((context_tokens, noisy_tokens), dim=-1)
         )
 
-        time_condition = (
-            self.noise_embedding(c_noise)
-            + self.condition_noise_embedding(c_noise_cond)
-        )
+        time_condition = self.noise_embedding(c_noise)
+        if c_noise_cond is not None:
+            time_condition = (
+                time_condition
+                + self.condition_noise_embedding(c_noise_cond)
+            )
         if act is None:
             action_tokens = torch.zeros(
                 x.shape[0], 1, x.shape[-1], device=x.device, dtype=x.dtype
@@ -506,6 +536,16 @@ class GaussianDiT(nn.Module):
         else:
             if act.ndim == 2:
                 act = act.unsqueeze(1)
+            if act.ndim != 3 or act.shape[0] != x.shape[0]:
+                raise ValueError(
+                    "Expected actions with shape [B,T,A], got "
+                    f"{tuple(act.shape)}"
+                )
+            if act.shape[-1] != self.action_dim:
+                raise ValueError(
+                    f"Expected action dimension {self.action_dim}, "
+                    f"got {act.shape[-1]}"
+                )
             action_tokens = self.action_projection(act)
 
         hidden_states = []

@@ -28,15 +28,26 @@ class DiffusionSampler:
         self.sigmas = build_sigmas(cfg.num_steps_denoising, cfg.sigma_min, cfg.sigma_max, cfg.rho, denoiser.device)
 
     @torch.no_grad()
-    def sample(self, prev_obs: Tensor, prev_act: Optional[Tensor], return_reward: bool = True) -> Tuple[Tensor, List[Tensor], Tensor]:
+    def sample(
+        self,
+        prev_obs: Tensor,
+        prev_act: Optional[Tensor],
+        return_reward: bool = True,
+    ) -> Tuple[Tensor, List[Tensor]]:
         device = prev_obs.device
         b, t, c, h, w = prev_obs.size()
         prev_obs = prev_obs.reshape(b, t * c, h, w)
-        s_in = torch.ones(b, device=device)
-        gamma_ = min(self.cfg.s_churn / (len(self.sigmas) - 1), 2**0.5 - 1)
-        x = torch.randn(b, c, h, w, device=device)
+        sigmas = self.sigmas.to(device=device, dtype=prev_obs.dtype)
+        gamma_ = min(
+            self.cfg.s_churn / max(len(sigmas) - 1, 1),
+            2**0.5 - 1,
+        )
+        # EDM sampling starts from N(0, sigma_max^2 I), not unit noise.
+        x = torch.randn(
+            b, c, h, w, device=device, dtype=prev_obs.dtype
+        ) * sigmas[0]
         trajectory = [x]
-        for sigma, next_sigma in zip(self.sigmas[:-1], self.sigmas[1:]):
+        for sigma, next_sigma in zip(sigmas[:-1], sigmas[1:]):
             gamma = gamma_ if self.cfg.s_tmin <= sigma <= self.cfg.s_tmax else 0
             sigma_hat = sigma * (gamma + 1)
             if gamma > 0:
@@ -47,7 +58,9 @@ class DiffusionSampler:
                 prev_obs = self.denoiser.apply_noise(prev_obs, sigma_cond, sigma_offset_noise=0)
             else:
                 sigma_cond = None
-            denoised = self.denoiser.denoise(x, sigma, sigma_cond, prev_obs, prev_act)
+            denoised = self.denoiser.denoise(
+                x, sigma_hat, sigma_cond, prev_obs, prev_act
+            )
             # reward = self.denoiser.predict_reward(x, sigma, prev_obs, prev_act) if return_reward else None
             d = (x - denoised) / sigma_hat
             dt = next_sigma - sigma_hat
@@ -57,7 +70,9 @@ class DiffusionSampler:
             else:
                 # Heun's method
                 x_2 = x + d * dt
-                denoised_2 = self.denoiser.denoise(x_2, next_sigma * s_in, sigma_cond, prev_obs, prev_act)
+                denoised_2 = self.denoiser.denoise(
+                    x_2, next_sigma, sigma_cond, prev_obs, prev_act
+                )
                 d_2 = (x_2 - denoised_2) / next_sigma
                 d_prime = (d + d_2) / 2
                 x = x + d_prime * dt
@@ -70,6 +85,15 @@ class DiffusionSampler:
 
 
 def build_sigmas(num_steps: int, sigma_min: float, sigma_max: float, rho: int, device: torch.device) -> Tensor:
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+    if not 0 < sigma_min <= sigma_max:
+        raise ValueError(
+            "Expected 0 < sigma_min <= sigma_max, got "
+            f"{sigma_min} and {sigma_max}"
+        )
+    if rho <= 0:
+        raise ValueError(f"rho must be positive, got {rho}")
     min_inv_rho = sigma_min ** (1 / rho)
     max_inv_rho = sigma_max ** (1 / rho)
     l = torch.linspace(0, 1, num_steps, device=device)

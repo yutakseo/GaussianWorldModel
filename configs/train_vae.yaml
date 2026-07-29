@@ -28,7 +28,7 @@ train:
 # epochs reuse these point clouds instead of recomputing them.
 gaussian_cache:
   enabled: true
-  # v3 stores FPS Gaussians together with intrinsics estimated before FPS.
+  # v4 stores center-only FPS Gaussians plus pre-FPS camera intrinsics.
   dir: ${paths.cache_root}/vae/${paths.date}/gaussian_features
   dtype: float16  # Set to float32 for an exact, larger cache.
 

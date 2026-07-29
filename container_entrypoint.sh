@@ -5,8 +5,6 @@ GWM_ROOT="${GWM_PATH:-/workspace}"
 export GWM_PATH="${GWM_ROOT}"
 export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/third_party/splatt3r/src/pixelsplat_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src:${GWM_ROOT}/third_party/splatt3r/src/mast3r_src/dust3r${PYTHONPATH:+:${PYTHONPATH}}"
 
-"${GWM_ROOT}/container_setup.sh"
-
 PERSISTED_CODEX_BIN=/root/.codex/packages/standalone/current/codex
 if [[ -x "${PERSISTED_CODEX_BIN}" ]]; then
     # /root/.codex is persisted, while /usr/local/bin belongs to each new
@@ -37,11 +35,17 @@ if [[ "${CODEX_REMOTE_CONTROL:-1}" == "1" ]]; then
 
         if ! timeout 30s "${CODEX_BIN}" remote-control start --json; then
             echo "warning: Codex remote-control daemon failed to start" >&2
+        elif ! "${CODEX_BIN}" app-server daemon version >/dev/null; then
+            echo "warning: Codex remote-control daemon started but did not remain healthy" >&2
         fi
     else
         echo "warning: Codex CLI is unavailable; remote control was not started" >&2
     fi
 fi
+
+# Make the remote-control protocol available immediately after container start.
+# Project setup can take several minutes when CUDA extensions need rebuilding.
+"${GWM_ROOT}/container_setup.sh"
 
 cd "${GWM_ROOT}"
 exec "$@"

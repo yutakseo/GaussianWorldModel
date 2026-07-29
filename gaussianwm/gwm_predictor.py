@@ -13,7 +13,8 @@ from gaussianwm.reward.reward_model import RewardModel, RewardModelConfig
 from termcolor import cprint
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from pytorch3d.ops import sample_farthest_points as fps
+
+from gaussianwm.encoder.models_ae import sample_farthest_gaussians
 
 
 def symlog(x):
@@ -26,12 +27,15 @@ def symexp(x):
 
 class GaussianPredictor(nn.Module):
     # def __init__(self, **kwargs) -> None:
-    def __init__(self, args) -> None:
+    def __init__(self, args, device=None) -> None:
         super().__init__()
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(
+            device
+            if device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         self.args = args
-        self.device = device
 
         uses_gaussian_tokens = (
             args.observation.use_gs and args.vae.use_vae
@@ -83,7 +87,12 @@ class GaussianPredictor(nn.Module):
         self.gaussian_feature_dim = 14
         if args.observation.use_gs:
             from gaussianwm.processor.regressor import Splatt3rRegressor, gaussian_feature_to_dim
-            self.splatt3r = Splatt3rRegressor().to(device).eval()
+            self.splatt3r = (
+                Splatt3rRegressor()
+                .to(device)
+                .requires_grad_(False)
+                .eval()
+            )
         if args.vae.use_vae:
             from gaussianwm.encoder.models_ae import create_autoencoder
             self.latent_dim = args.vae.latent_dim
@@ -101,50 +110,43 @@ class GaussianPredictor(nn.Module):
                         "Gaussian DiT checkpoint with the latent DiT."
                     )
                 vae_checkpoint = torch.load(
-                    args.vae.pretrained_path, map_location="cpu"
+                    args.vae.pretrained_path,
+                    map_location="cpu",
+                    weights_only=False,
                 )
-                if vae_checkpoint.get("format_version") != 2:
+                if vae_checkpoint.get("format_version") != 3:
                     raise ValueError(
                         "The VAE checkpoint predates the paper-aligned "
-                        "rendering-loss format and cannot be reused. "
+                        "multi-layer encoder/rendering-loss format and "
+                        "cannot be reused. "
                         "Retrain the VAE before training or running the DiT."
                     )
-                checkpoint_args = vae_checkpoint.get("args", {})
-                checkpoint_vae = (
-                    checkpoint_args.get("vae", {})
-                    if hasattr(checkpoint_args, "get")
-                    else {}
-                )
-                checkpoint_queries = (
-                    checkpoint_vae.get("decoder_num_queries")
-                    if hasattr(checkpoint_vae, "get")
-                    else None
-                )
-                if decoder_num_queries is None:
-                    decoder_num_queries = checkpoint_queries
-                elif checkpoint_queries != decoder_num_queries:
-                    raise ValueError(
-                        "Configured VAE decoder_num_queries "
-                        f"({decoder_num_queries}) does not match checkpoint "
-                        f"metadata ({checkpoint_queries})."
-                    )
                 expected_vae = {
-                    "model_dim": args.vae.model_dim,
-                    "num_latents": args.vae.num_latents,
-                    "latent_dim": args.vae.latent_dim,
-                    "use_kl": args.vae.use_kl,
-                }
-                for name, expected in expected_vae.items():
-                    actual = (
-                        checkpoint_vae.get(name)
-                        if hasattr(checkpoint_vae, "get")
+                    "spec_version": 3,
+                    "representation": "gaussian_vae",
+                    "model_dim": int(args.vae.model_dim),
+                    "depth": int(args.vae.vae_depth),
+                    "num_inputs": int(
+                        args.observation.point_cloud_size
+                    ),
+                    "num_latents": int(args.vae.num_latents),
+                    "latent_dim": int(args.vae.latent_dim),
+                    "decoder_num_queries": (
+                        int(decoder_num_queries)
+                        if decoder_num_queries is not None
                         else None
+                    ),
+                    "use_kl": bool(args.vae.use_kl),
+                    "output_dim": self.gaussian_feature_dim,
+                    "min_scale": float(args.vae.min_scale),
+                }
+                actual_vae = vae_checkpoint.get("architecture")
+                if actual_vae != expected_vae:
+                    raise ValueError(
+                        "VAE checkpoint architecture does not match the "
+                        "configured paper-aligned model. Expected "
+                        f"{expected_vae}, got {actual_vae}."
                     )
-                    if actual != expected:
-                        raise ValueError(
-                            f"Configured VAE {name} ({expected}) does not "
-                            f"match checkpoint metadata ({actual})."
-                        )
             self.vae = create_autoencoder(
                 depth=args.vae.vae_depth,
                 dim=args.vae.model_dim,
@@ -198,13 +200,27 @@ class GaussianPredictor(nn.Module):
         )
         self.diffusion_sampler = DiffusionSampler(self.model, sampler_config)
 
-        # Prepare the latent dynamics optimizer. The pretrained VAE is frozen.
-        self.model_optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.optimizer.model_lr)
-
+        optimizer_groups = [
+            {
+                "params": self.model.parameters(),
+                "lr": args.optimizer.model_lr,
+            }
+        ]
         if args.reward.use_reward_model:
-            self.reward_model = RewardModel(reward_model_config)
-            self.reward_model_optimizer = torch.optim.AdamW(self.reward_model.parameters(), lr=args.optimizer.reward_model_lr)
+            self.reward_model = RewardModel(reward_model_config).to(device)
+            optimizer_groups.append(
+                {
+                    "params": self.reward_model.parameters(),
+                    "lr": args.optimizer.reward_model_lr,
+                }
+            )
+        # The pretrained VAE and Splatt3R are frozen. Dynamics and the
+        # optional reward model are checkpointed and optimized together.
+        self.model_optimizer = torch.optim.AdamW(optimizer_groups)
 
+    @property
+    def device(self):
+        return self.model.device
 
     @torch.no_grad()
     def extract_gaussians(self, obs):
@@ -219,8 +235,8 @@ class GaussianPredictor(nn.Module):
         """Encode a [B,T,N,14] Gaussian sequence into the DiT latent grid."""
         B, T, N, D = points.shape
         flat_points = points.reshape(B * T, N, D).float()
-        flat_points, _ = fps(
-            flat_points, K=self.args.observation.point_cloud_size
+        flat_points, _ = sample_farthest_gaussians(
+            flat_points, self.args.observation.point_cloud_size
         )
         encoded = self.vae.encode(flat_points)
         if isinstance(encoded, tuple):
@@ -415,9 +431,13 @@ class GaussianPredictor(nn.Module):
         model_to_save = self.module if isinstance(self, DDP) else self
         checkpoint = {
             "model": model_to_save.model.state_dict(),
-            "format_version": 2,
+            "format_version": 3,
             "architecture": model_to_save._architecture_metadata(),
         }
+        if model_to_save.args.reward.use_reward_model:
+            checkpoint["reward_model"] = (
+                model_to_save.reward_model.state_dict()
+            )
         if optimizer is not None:
             checkpoint["optimizer"] = optimizer.state_dict()
         if step is not None:
@@ -439,6 +459,7 @@ class GaussianPredictor(nn.Module):
         checkpoint = torch.load(
             checkpoint_path,
             map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu',
+            weights_only=False,
         )
         architecture = checkpoint.get("architecture")
         expected_architecture = self._architecture_metadata()
@@ -452,12 +473,20 @@ class GaussianPredictor(nn.Module):
         # Backward compatibility with checkpoints that contain only model weights.
         state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
         self.model.load_state_dict(state_dict)
+        if self.args.reward.use_reward_model:
+            reward_state = checkpoint.get("reward_model")
+            if reward_state is None:
+                raise ValueError(
+                    "Reward-enabled checkpoint is missing reward model state"
+                )
+            self.reward_model.load_state_dict(reward_state)
         if optimizer is not None and "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         return checkpoint.get("step") if "model" in checkpoint else None
 
     def _architecture_metadata(self):
         return {
+            "spec_version": 3,
             "representation": (
                 "gaussian_tokens"
                 if self.args.observation.use_gs and self.args.vae.use_vae
@@ -478,4 +507,7 @@ class GaussianPredictor(nn.Module):
             "hidden_size": int(self.args.model.hidden_size),
             "depth": int(self.args.model.depth),
             "num_heads": int(self.args.model.num_heads),
+            "mlp_ratio": float(self.args.model.mlp_ratio),
+            "sigma_data": float(self.args.diffusion.sigma_data),
+            "reward_model": bool(self.args.reward.use_reward_model),
         }

@@ -257,7 +257,7 @@ class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
     def __init__(self):
-        self._scaler = torch.cuda.amp.GradScaler()
+        self._scaler = torch.amp.GradScaler("cuda")
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
         self._scaler.scale(loss).backward(create_graph=create_graph)
@@ -300,8 +300,10 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
 def _vae_architecture_metadata(args):
     vae = args.vae
     return {
+        "spec_version": 3,
         "representation": "gaussian_vae",
         "model_dim": int(vae.model_dim),
+        "depth": int(vae.vae_depth),
         "num_inputs": int(vae.point_cloud_size),
         "num_latents": int(vae.num_latents),
         "latent_dim": int(vae.latent_dim),
@@ -312,6 +314,7 @@ def _vae_architecture_metadata(args):
         ),
         "use_kl": bool(vae.use_kl),
         "output_dim": int(vae.output_dim),
+        "min_scale": float(vae.min_scale),
     }
 
 
@@ -330,7 +333,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
-                'format_version': 2,
+                'format_version': 3,
                 'architecture': _vae_architecture_metadata(args),
             }
 
@@ -356,7 +359,9 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(
+                args.resume, map_location="cpu", weights_only=False
+            )
         architecture = checkpoint.get("architecture")
         expected_architecture = _vae_architecture_metadata(args)
         if architecture != expected_architecture:

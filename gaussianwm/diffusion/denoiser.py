@@ -21,7 +21,7 @@ class Conditioners:
     c_out: Tensor
     c_skip: Tensor
     c_noise: Tensor
-    c_noise_cond: Tensor
+    c_noise_cond: Optional[Tensor]
 
 
 @dataclass
@@ -46,6 +46,12 @@ class Denoiser(nn.Module):
     def __init__(self, cfg: DenoiserConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        if cfg.sigma_data <= 0:
+            raise ValueError(
+                f"sigma_data must be positive, got {cfg.sigma_data}"
+            )
+        if cfg.sigma_offset_noise < 0:
+            raise ValueError("sigma_offset_noise must be non-negative")
         self.is_upsampler = cfg.upsampling_factor is not None
         cfg.inner_model.is_upsampler = self.is_upsampler
         if cfg.inner_model.token_based:
@@ -91,16 +97,25 @@ class Denoiser(nn.Module):
 
     def setup_training(self, cfg: SigmaDistributionConfig) -> None:
         assert self.sample_sigma_training is None
+        if cfg.scale < 0:
+            raise ValueError("Sigma log-normal scale must be non-negative")
+        if not 0 < cfg.sigma_min <= cfg.sigma_max:
+            raise ValueError(
+                "Expected 0 < sigma_min <= sigma_max, got "
+                f"{cfg.sigma_min} and {cfg.sigma_max}"
+            )
 
         def sample_sigma(n: int, device: torch.device):
             s = torch.randn(n, device=device) * cfg.scale + cfg.loc
-            return s.exp().clip(cfg.sigma_min, cfg.sigma_max)
+            return s.exp().clamp(cfg.sigma_min, cfg.sigma_max)
 
         self.sample_sigma_training = sample_sigma
 
     def apply_noise(self, x: Tensor, sigma: Tensor, sigma_offset_noise: float) -> Tensor:
         b, c, _, _ = x.shape
-        offset_noise = sigma_offset_noise * torch.randn(b, c, 1, 1, device=self.device)
+        offset_noise = sigma_offset_noise * torch.randn(
+            b, c, 1, 1, device=x.device, dtype=x.dtype
+        )
         return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
 
     def compute_conditioners(self, sigma: Tensor, sigma_cond: Optional[Tensor]) -> Conditioners:
@@ -108,9 +123,26 @@ class Denoiser(nn.Module):
         c_in = 1 / (sigma**2 + self.cfg.sigma_data**2).sqrt()
         c_skip = self.cfg.sigma_data**2 / (sigma**2 + self.cfg.sigma_data**2)
         c_out = sigma * c_skip.sqrt()
-        c_noise = sigma.log() / 4
-        c_noise_cond = sigma_cond.log() / 4 if sigma_cond is not None else torch.zeros_like(c_noise)
-        return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise, c_noise_cond), (4, 4, 4, 1, 1))))
+        c_noise = sigma.clamp_min(torch.finfo(sigma.dtype).tiny).log() / 4
+        c_noise_cond = (
+            sigma_cond.clamp_min(
+                torch.finfo(sigma_cond.dtype).tiny
+            ).log()
+            / 4
+            if sigma_cond is not None
+            else None
+        )
+        return Conditioners(
+            c_in=add_dims(c_in, 4),
+            c_out=add_dims(c_out, 4),
+            c_skip=add_dims(c_skip, 4),
+            c_noise=add_dims(c_noise, 1),
+            c_noise_cond=(
+                add_dims(c_noise_cond, 1)
+                if c_noise_cond is not None
+                else None
+            ),
+        )
 
     def compute_model_output(self, noisy_next_obs: Tensor, obs: Tensor, act: Optional[Tensor], cs: Conditioners) -> Tuple[Tensor, Tensor]:
         rescaled_obs = obs / self.cfg.sigma_data
@@ -126,9 +158,25 @@ class Denoiser(nn.Module):
             batch_mask_padding: (B, T)
         """
 
+        if self.sample_sigma_training is None:
+            raise RuntimeError("Call setup_training() before Denoiser.forward()")
+        if batch_obs.ndim != 5:
+            raise ValueError(
+                f"Expected observations [B,T,C,H,W], got {batch_obs.shape}"
+            )
+        if batch_action.ndim != 3:
+            raise ValueError(
+                f"Expected actions [B,T,A], got {batch_action.shape}"
+            )
         b, t, c, h, w = batch_obs.size()
+        if batch_action.shape[0] != b:
+            raise ValueError("Observation and action batch sizes differ")
         H, W = (self.cfg.upsampling_factor * h, self.cfg.upsampling_factor * w) if self.is_upsampler else (h, w)
         n = self.cfg.inner_model.context_length
+        if n <= 0 or t <= n:
+            raise ValueError(
+                f"Need T > context_length > 0, got T={t}, context={n}"
+            )
         seq_length = t - n  # t = n + 1 + num_autoregressive_steps
         if batch_action.size(1) < t - 1:
             raise ValueError(

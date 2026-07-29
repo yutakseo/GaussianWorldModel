@@ -38,6 +38,16 @@ def train_step(model, batch, optimizer, step, cfg):
         update_model=cfg.train.update_model
     )
     total_loss.backward()
+    max_grad_norm = cfg.world_model.optimizer.max_grad_norm
+    if max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(
+            (
+                parameter
+                for parameter in unwrap_model(model).parameters()
+                if parameter.requires_grad
+            ),
+            float(max_grad_norm),
+        )
     optimizer.step()
     return metrics
 
@@ -126,7 +136,7 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
         )
     
-    model = GaussianPredictor(cfg.world_model).to(device)
+    model = GaussianPredictor(cfg.world_model, device=device).to(device)
     optimizer = model.model_optimizer
     if cfg.distributed.distributed:
         model = DDP(model, device_ids=[cfg.distributed.gpu], find_unused_parameters=True)

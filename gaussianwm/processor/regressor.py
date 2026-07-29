@@ -67,18 +67,50 @@ gaussian_feature_to_dim = OrderedDict({
     # 'desc_conf': 1,
 })
 
-def get_gaussain_tensor(pred):
-    B = pred['scales'].shape[0]
-    return torch.cat([
-        pred[key].reshape(B, -1, value) 
-        for key, value in gaussian_feature_to_dim.items() if key in pred
-        ], dim=2
+def get_gaussian_tensor(pred):
+    """Pack a Splatt3R prediction into ``[B,N,14]`` physical Gaussians."""
+    mean_key = "means" if "means" in pred else "means_in_other_view"
+    required = (mean_key, "scales", "rotations", "sh", "opacities")
+    missing = [key for key in required if key not in pred]
+    if missing:
+        raise KeyError(f"Splatt3R prediction is missing {missing}")
+
+    batch_size = pred[mean_key].shape[0]
+    means = pred[mean_key].reshape(batch_size, -1, 3)
+    scales = pred["scales"].reshape(batch_size, -1, 3)
+    rotations = pred["rotations"].reshape(batch_size, -1, 4)
+    opacities = pred["opacities"].reshape(batch_size, -1, 1)
+
+    sh = pred["sh"]
+    if sh.ndim == pred[mean_key].ndim + 1:
+        # GWM uses the degree-zero RGB coefficient. Splatt3R checkpoints can
+        # expose additional coefficients in the final dimension.
+        sh = sh[..., 0]
+    sh = sh.reshape(batch_size, -1, 3)
+
+    point_counts = {
+        tensor.shape[1]
+        for tensor in (means, scales, rotations, sh, opacities)
+    }
+    if len(point_counts) != 1:
+        raise ValueError(
+            "Splatt3R Gaussian fields have inconsistent point counts: "
+            f"{sorted(point_counts)}"
+        )
+    return torch.cat(
+        (means, scales, rotations, sh, opacities), dim=-1
     )
+
+
+# Preserve the misspelled public name used by older callers.
+get_gaussain_tensor = get_gaussian_tensor
 
 def load_model(model_path, device, verbose=True):
     if verbose:
         print('... loading model from', model_path)
-    ckpt = torch.load(model_path, map_location='cpu')
+    ckpt = torch.load(
+        model_path, map_location="cpu", weights_only=False
+    )
 
     # print(ckpt.keys())  # dict_keys(['epoch', 'global_step', 'pytorch-lightning_version', 'state_dict', 'loops', 'callbacks', 'optimizer_states', 'lr_schedulers', 'hparams_name', 'hyper_parameters'])
 
@@ -161,7 +193,11 @@ class MAST3RGaussians(nn.Module):
             
         if os.path.isfile(pretrained_model_name_or_path):
             # Load the checkpoint
-            checkpoint = torch.load(pretrained_model_name_or_path, map_location=device)
+            checkpoint = torch.load(
+                pretrained_model_name_or_path,
+                map_location=device,
+                weights_only=False,
+            )
             
             # Create a config object
             from types import SimpleNamespace
@@ -537,6 +573,7 @@ class Splatt3rRegressor(nn.Module):
     def __init__(self, model_name: str = "brandonsmart/splatt3r_v1.0"):
         super().__init__()
         self.model = self.from_pretrained(model_name)
+        self.model.requires_grad_(False)
 
     @classmethod
     def from_pretrained(cls, model_name: str = "brandonsmart/splatt3r_v1.0") -> nn.Module:
@@ -605,9 +642,11 @@ class Splatt3rRegressor(nn.Module):
         
         return pred1, pred2
 
-    def forward_tensor(self, image_tensor: torch.Tensor) -> torch.Tensor:
+    def forward_tensor(
+        self, image_tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         pred1, pred2 = self.forward(image_tensor)
-        return get_gaussain_tensor(pred1), get_gaussain_tensor(pred2)
+        return get_gaussian_tensor(pred1), get_gaussian_tensor(pred2)
 
 if __name__ == "__main__":
     image_size = 512

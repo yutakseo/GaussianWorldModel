@@ -17,15 +17,17 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import einops
 from pytorch3d.loss import chamfer_distance
-from pytorch3d.ops import sample_farthest_points as fps
 
 from gaussianwm.processor.regressor import Splatt3rRegressor
-from gaussianwm.encoder.models_ae import create_autoencoder
+from gaussianwm.encoder.models_ae import (
+    create_autoencoder,
+    sample_farthest_gaussians,
+)
 from gaussianwm.rendering import (
     estimate_intrinsics_from_dense_gaussians,
     render_gaussians,
 )
-from gaussianwm.util import distributed_utils, lr_utils
+from gaussianwm.util import distributed_utils
 from gaussianwm.util import tensor_utils as TensorUtils
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
 from gaussianwm.util.distributed_utils import NativeScalerWithGradNormCount as NativeScaler
@@ -36,7 +38,7 @@ class GaussianFeatureCache:
     """Versioned cache for sampled Gaussians and camera calibration."""
 
     _DTYPES = {"float16": torch.float16, "float32": torch.float32}
-    VERSION = 3
+    VERSION = 4
 
     def __init__(self, cache_dir, enabled, dtype, split="train"):
         self.enabled = enabled
@@ -65,7 +67,7 @@ class GaussianFeatureCache:
         if not self.enabled:
             return
         path = self._path(batch_index)
-        tmp_path = path.with_suffix(".tmp")
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         torch.save(
             {
                 "version": self.VERSION,
@@ -164,8 +166,8 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
                     dense_points, image1.shape[-2:]
                 )
 
-            points, _ = fps(
-                dense_points.float(), K=cfg.vae.point_cloud_size
+            points, _ = sample_farthest_gaussians(
+                dense_points.float(), cfg.vae.point_cloud_size
             )
             cache.save(data_iter_step, points, intrinsics)
         else:
@@ -195,7 +197,8 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_chamfer=loss_chamfer.item())
@@ -253,8 +256,8 @@ def evaluate(model, data_loader, device, cfg, split="val"):
                     dense_points, image1.shape[-2:]
                 )
 
-            points, _ = fps(
-                dense_points.float(), K=cfg.vae.point_cloud_size
+            points, _ = sample_farthest_gaussians(
+                dense_points.float(), cfg.vae.point_cloud_size
             )
             cache.save(batch_index, points, intrinsics)
         else:

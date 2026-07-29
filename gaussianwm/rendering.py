@@ -16,8 +16,15 @@ from utils.geometry import build_covariance
 def estimate_intrinsics_from_dense_gaussians(gaussians, image_size):
     """Estimate normalized intrinsics from Splatt3R's pixel-aligned output."""
     height, width = image_size
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid image size: {image_size}")
     if gaussians.ndim == 2:
         gaussians = gaussians.unsqueeze(0)
+    if gaussians.ndim != 3 or gaussians.shape[-1] < 3:
+        raise ValueError(
+            "Expected dense Gaussians with shape [B,N,D>=3], got "
+            f"{tuple(gaussians.shape)}"
+        )
     if gaussians.shape[1] != height * width:
         raise ValueError(
             "Dense Gaussian count must match the source image: "
@@ -46,9 +53,18 @@ def estimate_intrinsics_from_dense_gaussians(gaussians, image_size):
 
     def fit_focal(q, pixel):
         mask = valid & torch.isfinite(q) & (q.abs() > 1.0e-4)
-        numerator = (q * (pixel - 0.5) * mask).sum(dim=(1, 2))
-        denominator = (q.square() * mask).sum(dim=(1, 2)).clamp_min(1.0e-8)
-        return (numerator / denominator).abs().clamp(0.25, 4.0)
+        safe_q = torch.where(mask, q, torch.zeros_like(q))
+        numerator = (safe_q * (pixel - 0.5)).sum(dim=(1, 2))
+        denominator = safe_q.square().sum(dim=(1, 2))
+        estimate = numerator / denominator.clamp_min(1.0e-8)
+        # Degenerate point maps should use a stable normalized-camera
+        # fallback rather than propagating NaNs into the rendering loss.
+        estimate = torch.where(
+            denominator > 1.0e-8,
+            estimate.abs(),
+            torch.ones_like(estimate),
+        )
+        return estimate.clamp(0.25, 4.0)
 
     intrinsics = torch.eye(
         3, device=means.device, dtype=means.dtype
@@ -66,6 +82,16 @@ def render_gaussians(gaussians, image_size, intrinsics):
         gaussians = gaussians.unsqueeze(0)
     if intrinsics.ndim == 2:
         intrinsics = intrinsics.unsqueeze(0)
+    if gaussians.ndim != 3 or gaussians.shape[-1] != 14:
+        raise ValueError(
+            "Expected physical Gaussians with shape [B,N,14], got "
+            f"{tuple(gaussians.shape)}"
+        )
+    if intrinsics.ndim != 3 or intrinsics.shape[-2:] != (3, 3):
+        raise ValueError(
+            "Expected intrinsics with shape [B,3,3], got "
+            f"{tuple(intrinsics.shape)}"
+        )
     if gaussians.shape[0] != intrinsics.shape[0]:
         raise ValueError(
             "Gaussian and intrinsics batch sizes differ: "
@@ -77,9 +103,14 @@ def render_gaussians(gaussians, image_size, intrinsics):
     means = decoded[..., 0:3].contiguous()
     scales = decoded[..., 3:6].clamp_min(1.0e-5)
     rotations = decoded[..., 6:10]
-    rotations = rotations / rotations.norm(
-        dim=-1, keepdim=True
-    ).clamp_min(1.0e-8)
+    rotation_norm = rotations.norm(dim=-1, keepdim=True)
+    identity = torch.zeros_like(rotations)
+    identity[..., 3] = 1.0
+    rotations = torch.where(
+        rotation_norm > 1.0e-8,
+        rotations / rotation_norm.clamp_min(1.0e-8),
+        identity,
+    )
     sh = decoded[..., 10:13, None].contiguous()
     opacities = decoded[..., 13].clamp(0.0, 1.0)
     covariances = build_covariance(scales, rotations).contiguous()

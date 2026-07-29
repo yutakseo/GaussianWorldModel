@@ -57,7 +57,6 @@ train_vae() {
         dataset=droid \
         "paths.date=${RUN_DATE}" \
         "paths.time=${RUN_TIME}" \
-        vae.decoder_num_queries=2048 \
         use_wandb=false \
         "${vae_overrides[@]}" \
         "${EXTRA_OVERRIDES[@]}"

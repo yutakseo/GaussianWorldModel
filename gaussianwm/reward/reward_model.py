@@ -59,8 +59,12 @@ class RewardModel(nn.Module):
         self.cfg = cfg
         self.encoder = RewardEncoder(2 * cfg.img_channels, cfg.cond_channels, cfg.depths, cfg.channels, cfg.attn_depths)
         self.act_emb = ActionEmbedder(cfg.lstm_dim, cfg.action_dim)
-        input_dim_lstm = cfg.channels[-1] * (cfg.img_size // 2 ** (len(cfg.depths) - 1)) ** 2
-        self.lstm = nn.LSTM(input_dim_lstm, cfg.lstm_dim, batch_first=True)
+        # Gaussian latents are [C,1,N] token maps rather than square images.
+        # Global pooling keeps the paper's Conv/ResBlock + LSTM design valid
+        # for both representations without assuming H == W.
+        self.lstm = nn.LSTM(
+            cfg.channels[-1], cfg.lstm_dim, batch_first=True
+        )
         self.head = nn.Sequential(
             nn.Linear(cfg.lstm_dim, cfg.lstm_dim),
             nn.SiLU(),
@@ -78,7 +82,8 @@ class RewardModel(nn.Module):
         b, t, c, h, w = obs.shape
         obs, act, next_obs = obs.reshape(b * t, c, h, w), act.reshape(b * t, -1), next_obs.reshape(b * t, c, h, w)
         x = self.encoder(torch.cat((obs, next_obs), dim=1), self.act_emb(act))
-        x = x.reshape(b, t, -1)  # (b t) e h w -> b t (e h w)
+        x = F.adaptive_avg_pool2d(x, output_size=1).flatten(1)
+        x = x.reshape(b, t, -1)
         x, hx_cx = self.lstm(x, hx_cx)
         reward = self.head(x)
         return reward, hx_cx

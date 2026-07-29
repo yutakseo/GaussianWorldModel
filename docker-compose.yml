@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     image: gaussianwm-dev:torch2.5.1-cuda12.1
     container_name: gaussianwm-dev
+    # Reap Codex daemon children correctly and bring the container back after
+    # Docker/host restarts unless it was explicitly stopped.
+    init: true
+    restart: unless-stopped
     working_dir: /workspace
     stdin_open: true
     tty: true

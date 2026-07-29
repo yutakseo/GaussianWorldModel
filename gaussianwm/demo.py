@@ -51,13 +51,18 @@ def save_rollout_video(
 
 
 def decode_gaussians(model, latent):
-    """Decode one latent frame into the Gaussian parameter representation."""
-    if model.args.vae.use_vae:
-        latent = latent.permute(1, 2, 0).reshape(
-            1, model.args.vae.num_latents, -1
-        )
-        return model.vae.decode(latent).float()
-    return latent.permute(1, 2, 0).reshape(1, -1, latent.shape[0]).float()
+    """Convert one token or legacy grid frame into Gaussian parameters."""
+    if model.uses_gaussian_tokens:
+        if latent.ndim == 2:
+            latent = latent.unsqueeze(0)
+        return model.decode_latents(latent).float()
+    if latent.ndim == 3:
+        return latent.permute(1, 2, 0).reshape(1, -1, latent.shape[0]).float()
+    if latent.ndim == 4:
+        return latent.permute(0, 2, 3, 1).reshape(
+            latent.shape[0], -1, latent.shape[1]
+        ).float()
+    return latent.unsqueeze(0).float() if latent.ndim == 2 else latent.float()
 
 
 def estimate_intrinsics_from_gaussians(gaussians, source_shape):
@@ -179,9 +184,14 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
                 predicted = []
                 for t in range(obs.shape[1] - context_length):
                     ctx = torch.stack(frames[-context_length:], dim=1)
-                    next_latent = model.diffusion_sampler.sample(
-                        ctx, replay_policy(None, t)
-                    )[0]
+                    if model.uses_gaussian_tokens:
+                        next_latent = model.sample_next_latents(
+                            ctx, replay_policy(None, t)
+                        )
+                    else:
+                        next_latent = model.diffusion_sampler.sample(
+                            ctx, replay_policy(None, t)
+                        )[0]
                     predicted.append(next_latent)
                     frames.append(next_latent)
                 rollout_obs = torch.stack(predicted, dim=1)
@@ -202,18 +212,29 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             
             cprint(f"Inference time: {inference_time:.3f}s", 'cyan')
             
-            obs_mse = ((rollout_obs - target_obs) ** 2).mean()
+            latent_mse = ((rollout_obs - target_obs) ** 2).mean()
             metrics_summary.append({
                 'sample_id': i,
-                'mse': obs_mse.item(),
+                'latent_mse': latent_mse.item(),
                 'inference_time': inference_time
             })
-            cprint(f"MSE: {obs_mse.item():.6f}", 'magenta')
+            cprint(f"Latent MSE: {latent_mse.item():.6f}", 'magenta')
             
             gt_frames = []
             source_frames = []
             vae_frames = []
             pred_frames = []
+
+            decoded_targets = (
+                model.decode_latents(target_obs)
+                if model.uses_gaussian_tokens
+                else None
+            )
+            decoded_predictions = (
+                model.decode_latents(rollout_obs)
+                if model.uses_gaussian_tokens
+                else None
+            )
             
             for t in range(rollout_obs.shape[1]):
                 gt_frame = obs[0, context_length + t].cpu().numpy().transpose(1,2,0).astype(np.uint8)
@@ -226,14 +247,24 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
                     source_frame = render_gaussian_tensor(
                         source_gaussians, gt_frame.shape[:2], intrinsics
                     )
-                    vae_frame = gaussian_preview(
-                        model, target_obs[0, t], gt_frame.shape[:2],
-                        intrinsics,
-                    )
-                    pred_frame = gaussian_preview(
-                        model, rollout_obs[0, t], gt_frame.shape[:2],
-                        intrinsics,
-                    )
+                    if model.uses_gaussian_tokens:
+                        vae_frame = render_gaussian_tensor(
+                            decoded_targets[0, t],
+                            gt_frame.shape[:2],
+                            intrinsics,
+                        )
+                        pred_frame = render_gaussian_tensor(
+                            decoded_predictions[0, t],
+                            gt_frame.shape[:2],
+                            intrinsics,
+                        )
+                    else:
+                        vae_frame = gaussian_preview(
+                            model, target_obs[0, t], gt_frame.shape[:2], intrinsics
+                        )
+                        pred_frame = gaussian_preview(
+                            model, rollout_obs[0, t], gt_frame.shape[:2], intrinsics
+                        )
                 else:
                     source_frame = gt_frame
                     vae_frame = gt_frame
@@ -325,7 +356,7 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
             i += 1
 
     if metrics_summary:
-        avg_mse = np.mean([m['mse'] for m in metrics_summary])
+        avg_mse = np.mean([m['latent_mse'] for m in metrics_summary])
         avg_time = np.mean([m['inference_time'] for m in metrics_summary])
         avg_rendered_mse = np.mean(
             [m["rendered_rgb_mse"] for m in metrics_summary]
@@ -339,7 +370,7 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
 
         summary = {
             'num_samples': len(metrics_summary),
-            'average_mse': avg_mse,
+            'average_latent_mse': avg_mse,
             'average_source_rendered_rgb_mse': avg_source_rendered_mse,
             'average_vae_rendered_rgb_mse': avg_vae_rendered_mse,
             'average_rendered_rgb_mse': avg_rendered_mse,
@@ -350,7 +381,7 @@ def demo_inference(model, dataset, cfg, num_samples=5, output_dir='demo_outputs'
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         
-        cprint(f"Average MSE: {avg_mse:.6f}", 'blue')
+        cprint(f"Average latent MSE: {avg_mse:.6f}", 'blue')
         cprint(
             f"Average source Gaussian RGB MSE: {avg_source_rendered_mse:.6f}",
             "blue",

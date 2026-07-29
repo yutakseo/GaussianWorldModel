@@ -7,6 +7,7 @@ point_cloud_size: 2048
 use_vae: true
 vae_depth: 4
 model_dim: 512
+# Paper Appendix B.2: 2,048 input Gaussians are reduced to 512 latents.
 num_latents: 512
 latent_dim: 64
 # The paper's mirrored decoder reconstructs one Gaussian per latent point.

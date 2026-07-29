@@ -247,7 +247,10 @@ def sample_farthest_gaussians(gaussians, num_samples):
     centers = gaussians[..., :3].float()
     if not torch.isfinite(centers).all():
         raise ValueError("Gaussian centers contain NaN or infinite values")
-    _, sampled_indices = fps(centers, K=num_samples)
+    # Keep the Gaussian query set stable across VAE/DiT encode calls.
+    _, sampled_indices = fps(
+        centers, K=num_samples, random_start_point=False
+    )
     sampled = torch.gather(
         gaussians,
         1,
@@ -335,11 +338,12 @@ class AutoEncoder(nn.Module):
         initialize_gaussian_output(self.to_outputs)
 
     def encode(self, pc):
-        # pc: B x N x D (D=14: xyz + features)
+        """Encode 2,048 Gaussian inputs into the paper's 512 latent queries."""
         B, N, D = pc.shape
         assert N == self.num_inputs, f"Expected {self.num_inputs} point cloud inputs, got {N}"
 
-        ###### FPS sampling based on XYZ coordinates
+        # Paper Appendix B.2: input N=2,048 -> FPS queries M=512.
+        # The full input point set remains the cross-attention context below.
         sampled_pc, _ = sample_farthest_gaussians(
             pc, self.num_latents
         )
@@ -470,10 +474,12 @@ class KLAutoEncoder(nn.Module):
         self.logvar_fc = nn.Linear(dim, latent_dim)
 
     def encode(self, pc):
-        # pc: B x N x D
+        """Encode 2,048 Gaussian inputs into variational 512-token latents."""
         B, N, D = pc.shape
         assert N == self.num_inputs
 
+        # Paper Appendix B.2: input N=2,048 -> FPS queries M=512.
+        # ``pc`` remains the complete cross-attention context.
         sampled_pc, _ = sample_farthest_gaussians(
             pc, self.num_latents
         )

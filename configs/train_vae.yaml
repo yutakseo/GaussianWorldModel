@@ -24,13 +24,17 @@ train:
   max_batches_per_epoch: null
   max_eval_batches: null
 
-# During the first epoch, save frozen Splatt3r + FPS outputs here. Later
-# epochs reuse these point clouds instead of recomputing them.
+# Cache frozen Splatt3r outputs after the DROID-specific dense-to-2,048 input
+# adaptation. V6 stores one RGB sequence per entry, so shuffled/re-grouped
+# RLDS batches reuse the right targets without multiplying cache files.
 gaussian_cache:
   enabled: true
-  # v4 stores center-only FPS Gaussians plus pre-FPS camera intrinsics.
-  dir: ${paths.cache_root}/vae/${paths.date}/gaussian_features
+  # Keep legacy batch-keyed caches untouched; V6 uses per-sequence entries.
+  dir: ${paths.cache_root}/vae/${paths.date}/gaussian_features_v6
   dtype: float16  # Set to float32 for an exact, larger cache.
+  # Bound disk use if a stochastic upstream pipeline emits unbounded windows.
+  # Known entries remain readable after the cap; only new misses are skipped.
+  max_entries: 40000
 
 # Optimizer settings
 optimizer:

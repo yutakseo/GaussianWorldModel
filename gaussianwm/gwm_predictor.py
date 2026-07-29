@@ -6,8 +6,17 @@ import time
 import torch
 import torch.nn as nn
 
-from gaussianwm.diffusion.denoiser import Denoiser, DenoiserConfig, SigmaDistributionConfig
-from gaussianwm.diffusion.diffusion_sampler import DiffusionSampler, DiffusionSamplerConfig
+from gaussianwm.diffusion.denoiser import (
+    Denoiser,
+    DenoiserConfig,
+    GaussianLatentDenoiser,
+    SigmaDistributionConfig,
+)
+from gaussianwm.diffusion.diffusion_sampler import (
+    DiffusionSampler,
+    DiffusionSamplerConfig,
+    GaussianDiffusionSampler,
+)
 from gaussianwm.diffusion.models import InnerModelConfig
 from gaussianwm.reward.reward_model import RewardModel, RewardModelConfig
 from termcolor import cprint
@@ -40,6 +49,18 @@ class GaussianPredictor(nn.Module):
         uses_gaussian_tokens = (
             args.observation.use_gs and args.vae.use_vae
         )
+        self.uses_gaussian_tokens = uses_gaussian_tokens
+        if uses_gaussian_tokens and args.reward.use_reward_model:
+            raise NotImplementedError(
+                "The reward model still expects image grids. Disable "
+                "reward.use_reward_model for the Gaussian token pipeline."
+            )
+        if uses_gaussian_tokens and not args.vae.get("pretrained_path"):
+            raise ValueError(
+                "The Gaussian token DiT requires a trained VAE checkpoint. "
+                "Set world_model.vae.pretrained_path before training or "
+                "inference."
+            )
 
         # Initialize the paper's one-step EDM dynamics model.
         denoiser_config = DenoiserConfig(
@@ -114,16 +135,18 @@ class GaussianPredictor(nn.Module):
                     map_location="cpu",
                     weights_only=False,
                 )
-                if vae_checkpoint.get("format_version") != 3:
+                if vae_checkpoint.get("format_version") != 5:
                     raise ValueError(
                         "The VAE checkpoint predates the paper-aligned "
-                        "multi-layer encoder/rendering-loss format and "
+                        "2,048-to-512 token format and "
                         "cannot be reused. "
                         "Retrain the VAE before training or running the DiT."
                     )
                 expected_vae = {
-                    "spec_version": 3,
+                    "spec_version": 5,
                     "representation": "gaussian_vae",
+                    "latent_query_source": "fps_2048_to_512",
+                    "latent_interface": "token_sequence_v1",
                     "model_dim": int(args.vae.model_dim),
                     "depth": int(args.vae.vae_depth),
                     "num_inputs": int(
@@ -160,6 +183,9 @@ class GaussianPredictor(nn.Module):
             ).to(device)
             if vae_checkpoint is not None:
                 self.vae.load_state_dict(vae_checkpoint["model"])
+            if uses_gaussian_tokens:
+                # The three-stage pipeline trains the VAE separately; DiT
+                # optimization must never update or sample from it.
                 self.vae.requires_grad_(False).eval()
             cprint(f"[VAE] Trainable parameters: {sum(p.numel() for p in self.vae.parameters() if p.requires_grad)/1e6}M", 'yellow')
             cprint(f"[VAE] Total parameters: {sum(p.numel() for p in self.vae.parameters())/1e6}M", 'yellow')
@@ -169,17 +195,10 @@ class GaussianPredictor(nn.Module):
             denoiser_config.inner_model.in_channels = 14
             if args.reward.use_reward_model:
                 reward_model_config.img_channels = 14
-        if args.vae.use_vae:
-            # Gaussian VAE embeddings are a set of latent points, not a
-            # fabricated square image grid.
-            self.nh = 1
-            self.nw = args.vae.num_latents
-
-            if args.reward.use_reward_model:
-                reward_model_config.img_size = self.nh
-                reward_model_config.img_channels = args.vae.latent_dim
-
-        self.model = Denoiser(denoiser_config).to(device)
+        if uses_gaussian_tokens:
+            self.model = GaussianLatentDenoiser(denoiser_config).to(device)
+        else:
+            self.model = Denoiser(denoiser_config).to(device)
         self.model.setup_training(
             SigmaDistributionConfig(
                 loc=args.diffusion.sigma_loc,
@@ -198,7 +217,12 @@ class GaussianPredictor(nn.Module):
             rho=args.diffusion.rho,
             order=args.diffusion.order,
         )
-        self.diffusion_sampler = DiffusionSampler(self.model, sampler_config)
+        if uses_gaussian_tokens:
+            self.diffusion_sampler = GaussianDiffusionSampler(
+                self.model, sampler_config
+            )
+        else:
+            self.diffusion_sampler = DiffusionSampler(self.model, sampler_config)
 
         optimizer_groups = [
             {
@@ -232,18 +256,71 @@ class GaussianPredictor(nn.Module):
 
     @torch.no_grad()
     def encode_gaussians(self, points):
-        """Encode a [B,T,N,14] Gaussian sequence into the DiT latent grid."""
+        """VAE encoder stage: Gaussian inputs -> ``[B,T,512,64]`` tokens."""
+        if not self.uses_gaussian_tokens:
+            raise RuntimeError("Gaussian VAE tokens are disabled")
+        if points.ndim != 4 or points.shape[-1] != self.gaussian_feature_dim:
+            raise ValueError(
+                "Expected Gaussian inputs [B,T,N,14], got "
+                f"{tuple(points.shape)}"
+            )
         B, T, N, D = points.shape
         flat_points = points.reshape(B * T, N, D).float()
+        # DROID/Splatt3R adaptation: establish the paper's 2,048-point VAE
+        # input set. The VAE itself then performs its paper-specified
+        # 2,048 -> 512 query FPS in ``vae.encode``.
         flat_points, _ = sample_farthest_gaussians(
             flat_points, self.args.observation.point_cloud_size
         )
         encoded = self.vae.encode(flat_points)
         if isinstance(encoded, tuple):
             _, encoded = encoded
-        encoded = encoded.view(B, T, -1, encoded.shape[-1])
-        return encoded.permute(0, 1, 3, 2).contiguous().view(
-            B, T, encoded.shape[-1], self.nh, self.nw
+        return encoded.view(B, T, encoded.shape[1], encoded.shape[2])
+
+    @torch.no_grad()
+    def decode_latents(self, latents):
+        """VAE decoder stage: ``[B,(T),512,64]`` tokens -> Gaussians.
+
+        The decoder is intentionally applied only after latent-DiT sampling;
+        EDM steps and autoregressive context remain in latent space.
+        """
+        if not self.uses_gaussian_tokens:
+            raise RuntimeError("Gaussian VAE tokens are disabled")
+        squeeze_time = latents.ndim == 3
+        if squeeze_time:
+            latents = latents.unsqueeze(1)
+        if latents.ndim != 4:
+            raise ValueError(
+                "Expected latent tokens [B,N,D] or [B,T,N,D], got "
+                f"{tuple(latents.shape)}"
+            )
+        batch, time_steps, num_tokens, channels = latents.shape
+        expected = (self.args.vae.num_latents, self.args.vae.latent_dim)
+        if (num_tokens, channels) != expected:
+            raise ValueError(
+                f"Expected VAE latents [*,*,{expected[0]},{expected[1]}], "
+                f"got {tuple(latents.shape)}"
+            )
+        decoded = self.vae.decode(
+            latents.reshape(batch * time_steps, num_tokens, channels)
+        ).float()
+        decoded = decoded.view(
+            batch, time_steps, decoded.shape[1], decoded.shape[2]
+        )
+        return decoded[:, 0] if squeeze_time else decoded
+
+    @torch.no_grad()
+    def sample_next_latents(self, context_latents, action):
+        """DiT stage: predict one ``[B,512,64]`` future latent frame."""
+        if not self.uses_gaussian_tokens:
+            raise RuntimeError("Gaussian VAE tokens are disabled")
+        return self.diffusion_sampler.sample(context_latents, action)[0]
+
+    @torch.no_grad()
+    def predict_next_gaussians(self, context_latents, action):
+        """Run DiT, then VAE-decode its final latent prediction."""
+        return self.decode_latents(
+            self.sample_next_latents(context_latents, action)
         )
 
     def _process_obs(self, obs):
@@ -359,22 +436,28 @@ class GaussianPredictor(nn.Module):
         x = obs.to(self.device).float()
         B, Ctot, H, W = x.shape
 
-        if args.observation.use_gs:
-            ch_per_frame = (args.vae.latent_dim if args.vae.use_vae else 14)
+        if args.observation.use_gs and self.uses_gaussian_tokens:
             assert Ctot % args.context_length == 0
-            frames_img = [x[:, i*(Ctot//args.context_length):(i+1)*(Ctot//args.context_length)] for i in range(args.context_length)]
-            context_imgs = torch.stack(frames_img, dim=1)  # [B, T, C_img, H, W]
-            context_latents = self._process_obs(context_imgs / 255.)  # [B, T, Cg, H', W']
-            frames = [context_latents[:, i] for i in range(args.context_length)]  # list of [B, Cg, H', W']
+            frames_img = [
+                x[:, i * (Ctot // args.context_length):
+                  (i + 1) * (Ctot // args.context_length)]
+                for i in range(args.context_length)
+            ]
+            context_imgs = torch.stack(frames_img, dim=1)
+            context_latents = self._process_obs(context_imgs / 255.)
+            # Canonical Gaussian-latent frame shape: [B, N=512, D=64].
+            frames = [
+                context_latents[:, i] for i in range(args.context_length)
+            ]
 
-            obss = [torch.cat(frames, dim=1)]
+            obss = [torch.stack(frames, dim=1)]
             actions, rewards = [], []
 
             for t in range(horizon):
                 ctx = torch.stack(frames[-args.context_length:], dim=1)
-                obs_for_policy = torch.cat(frames[-args.context_length:], dim=1)
+                obs_for_policy = ctx
                 action = policy(obs_for_policy, t)
-                next_latent = self.diffusion_sampler.sample(ctx, action)[0]
+                next_latent = self.sample_next_latents(ctx, action)
 
                 if args.reward.use_reward_model:
                     prev_lat = ctx[:, -1].unsqueeze(1)
@@ -386,7 +469,7 @@ class GaussianPredictor(nn.Module):
                 frames.append(next_latent)
                 frames.pop(0)
 
-                obss.append(torch.cat(frames[-args.context_length:], dim=1))
+                obss.append(torch.stack(frames[-args.context_length:], dim=1))
                 actions.append(action)
                 rewards.append(rew_pred)
 
@@ -396,6 +479,50 @@ class GaussianPredictor(nn.Module):
                 rewards = [symexp(r) for r in rewards]
 
             return torch.stack(obss, 1).float(), torch.stack(actions, 1).float(), torch.stack(rewards, 1).float()
+
+        if args.observation.use_gs:
+            # Preserve the legacy raw-Gaussian grid rollout for configurations
+            # that explicitly disable the VAE.  The paper-aligned default
+            # above remains the direct token path.
+            assert Ctot % args.context_length == 0
+            frames_img = [
+                x[:, i * (Ctot // args.context_length):
+                  (i + 1) * (Ctot // args.context_length)]
+                for i in range(args.context_length)
+            ]
+            context_imgs = torch.stack(frames_img, dim=1)
+            context_gaussians = self._process_obs(context_imgs / 255.0)
+            frames = [
+                context_gaussians[:, i]
+                for i in range(args.context_length)
+            ]
+            obss, actions, rewards = [torch.cat(frames, dim=1)], [], []
+
+            for t in range(horizon):
+                context = torch.stack(
+                    frames[-args.context_length:], dim=1
+                )
+                action = policy(
+                    torch.cat(frames[-args.context_length:], dim=1), t
+                )
+                next_gaussians = self.diffusion_sampler.sample(
+                    context, action
+                )[0]
+                frames.append(next_gaussians)
+                frames.pop(0)
+                obss.append(torch.cat(frames[-args.context_length:], dim=1))
+                actions.append(action)
+                rewards.append(torch.zeros_like(action[:, 0]))
+
+            actions = [torch.zeros_like(actions[0])] + actions
+            rewards = [torch.zeros_like(rewards[0])] + rewards
+            if args.symlog:
+                rewards = [symexp(reward) for reward in rewards]
+            return (
+                torch.stack(obss, 1).float(),
+                torch.stack(actions, 1).float(),
+                torch.stack(rewards, 1).float(),
+            )
 
         frames = [x[:, i*(Ctot//args.context_length):(i+1)*(Ctot//args.context_length)] for i in range(args.context_length)]
         obss, actions, rewards = [torch.cat(frames, dim=1)], [], []
@@ -431,7 +558,7 @@ class GaussianPredictor(nn.Module):
         model_to_save = self.module if isinstance(self, DDP) else self
         checkpoint = {
             "model": model_to_save.model.state_dict(),
-            "format_version": 3,
+            "format_version": 5,
             "architecture": model_to_save._architecture_metadata(),
         }
         if model_to_save.args.reward.use_reward_model:
@@ -486,7 +613,11 @@ class GaussianPredictor(nn.Module):
 
     def _architecture_metadata(self):
         return {
-            "spec_version": 3,
+            "spec_version": 5,
+            "vae_spec_version": (
+                5 if self.args.observation.use_gs and self.args.vae.use_vae
+                else None
+            ),
             "representation": (
                 "gaussian_tokens"
                 if self.args.observation.use_gs and self.args.vae.use_vae

@@ -30,8 +30,9 @@ autoencoder:
 
 This writes weights to `ckpt/vae/YYYY-MM-DD`, logs and the live loss graph to
 `logs/train/vae/YYYY-MM-DD`, and reusable Gaussian features plus camera
-calibration to `cache/vae/YYYY-MM-DD`. Following the paper, the encoder uses
-FPS to reduce 2,048 Gaussians to 512 variational latent points. The VAE is
+calibration to `cache/vae/YYYY-MM-DD`. Following Appendix B.2 of the paper,
+the VAE applies FPS from 2,048 Gaussian inputs to 512 variational latent
+points. The VAE is
 trained with center Chamfer loss and differentiable Gaussian-rendering L1.
 
 Train the diffusion model:

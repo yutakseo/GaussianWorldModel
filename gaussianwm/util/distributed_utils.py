@@ -300,8 +300,10 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
 def _vae_architecture_metadata(args):
     vae = args.vae
     return {
-        "spec_version": 3,
+        "spec_version": 5,
         "representation": "gaussian_vae",
+        "latent_query_source": "fps_2048_to_512",
+        "latent_interface": "token_sequence_v1",
         "model_dim": int(vae.model_dim),
         "depth": int(vae.vae_depth),
         "num_inputs": int(vae.point_cloud_size),
@@ -333,7 +335,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
-                'format_version': 3,
+                'format_version': 5,
                 'architecture': _vae_architecture_metadata(args),
             }
 

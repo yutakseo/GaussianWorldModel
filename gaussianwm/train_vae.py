@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import hashlib
 import wandb
 import math
 from pathlib import Path
@@ -35,25 +36,69 @@ from gaussianwm.util.plot_training_metrics import render as render_loss_plot
 
 
 class GaussianFeatureCache:
-    """Versioned cache for sampled Gaussians and camera calibration."""
+    """Versioned cache for VAE input Gaussians and camera calibration.
+
+    Cache entries are keyed by the source image tensor, not by iterator index.
+    RLDS training is shuffled, so an index-only cache can silently pair a
+    Gaussian target from one trajectory with a later trajectory.
+    """
 
     _DTYPES = {"float16": torch.float16, "float32": torch.float32}
-    VERSION = 4
+    # V6 changes the unit from a shuffled *batch* to one RGB sequence.  A
+    # batch key is unsafe operationally: the same sequences are regrouped on
+    # every epoch, so it continually creates duplicate cache entries.
+    VERSION = 6
 
-    def __init__(self, cache_dir, enabled, dtype, split="train"):
+    def __init__(
+        self, cache_dir, enabled, dtype, split="train", max_entries=None
+    ):
         self.enabled = enabled
         self.dtype = self._DTYPES[dtype]
         self.cache_dir = Path(cache_dir) / split
+        self.max_entries = (
+            int(max_entries) if max_entries is not None else None
+        )
+        if self.max_entries is not None and self.max_entries <= 0:
+            raise ValueError("gaussian_cache.max_entries must be positive")
+        self._entry_count = 0
         if self.enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._entry_count = sum(
+                1 for _ in self.cache_dir.glob("sample_*.pt")
+            )
 
-    def _path(self, batch_index):
-        return self.cache_dir / f"batch_{batch_index:06d}.pt"
+    @staticmethod
+    def _key_for_tensor(images):
+        """Return a stable content key for one RGB sequence tensor."""
+        if not isinstance(images, torch.Tensor):
+            raise TypeError(
+                "Gaussian cache keys require a torch.Tensor image sequence, got "
+                f"{type(images)!r}"
+            )
+        tensor = images.detach().to(device="cpu").contiguous()
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+        return digest.hexdigest()
 
-    def load(self, batch_index):
+    def keys_for_images(self, images):
+        """Return one cache key per ``[T,H,W,C]`` sequence in a batch."""
+        if not isinstance(images, torch.Tensor) or images.ndim != 5:
+            raise ValueError(
+                "Expected source images [B,T,H,W,C] for Gaussian cache keys, "
+                f"got {type(images)!r} with shape "
+                f"{getattr(images, 'shape', None)}"
+            )
+        return [self._key_for_tensor(sequence) for sequence in images]
+
+    def _path(self, key):
+        return self.cache_dir / f"sample_{key}.pt"
+
+    def load(self, key):
         if not self.enabled:
             return None
-        path = self._path(batch_index)
+        path = self._path(key)
         if not path.is_file():
             return None
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -61,12 +106,41 @@ class GaussianFeatureCache:
             return None
         if "points" not in payload or "intrinsics" not in payload:
             return None
-        return payload["points"], payload["intrinsics"]
+        points = payload["points"]
+        intrinsics = payload["intrinsics"]
+        # V6 stores one sequence at a time: [T,2048,14] and [T,3,3].
+        # Reject malformed entries rather than failing later in the VAE.
+        if (
+            not isinstance(points, torch.Tensor)
+            or not isinstance(intrinsics, torch.Tensor)
+            or points.ndim != 3
+            or intrinsics.ndim != 3
+            or points.shape[0] != intrinsics.shape[0]
+        ):
+            return None
+        return points, intrinsics
 
-    def save(self, batch_index, points, intrinsics):
+    def save(self, key, points, intrinsics):
         if not self.enabled:
             return
-        path = self._path(batch_index)
+        if (
+            points.ndim != 3
+            or intrinsics.ndim != 3
+            or points.shape[0] != intrinsics.shape[0]
+        ):
+            raise ValueError(
+                "Gaussian cache entries must be per-sequence [T,N,D] and "
+                f"[T,3,3], got {tuple(points.shape)} and "
+                f"{tuple(intrinsics.shape)}"
+            )
+        path = self._path(key)
+        is_new_entry = not path.is_file()
+        if (
+            is_new_entry
+            and self.max_entries is not None
+            and self._entry_count >= self.max_entries
+        ):
+            return
         tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         torch.save(
             {
@@ -81,6 +155,90 @@ class GaussianFeatureCache:
             tmp_path,
         )
         os.replace(tmp_path, path)
+        if is_new_entry:
+            self._entry_count += 1
+
+
+def load_or_compute_gaussian_batch(images, cache, splatt3r, device, cfg):
+    """Return cached or frozen-Splatt3R VAE inputs for a BTHWC RGB batch.
+
+    The cache is intentionally per input sequence instead of per DataLoader
+    batch.  RLDS shuffles and re-groups sequences each epoch; caching an
+    entire batch therefore grows without bound while yielding almost no hits.
+    """
+    if not isinstance(images, torch.Tensor) or images.ndim != 5:
+        raise ValueError(
+            "Expected VAE source images [B,T,H,W,C], got "
+            f"{type(images)!r} with shape {getattr(images, 'shape', None)}"
+        )
+
+    batch_size, time_steps, height, width, _ = images.shape
+    if cache.enabled:
+        keys = cache.keys_for_images(images)
+        entries = [cache.load(key) for key in keys]
+    else:
+        keys = [None] * batch_size
+        entries = [None] * batch_size
+    missing_indices = [
+        index for index, entry in enumerate(entries) if entry is None
+    ]
+
+    if missing_indices:
+        if splatt3r is None:
+            splatt3r = Splatt3rRegressor().to(device).eval()
+
+        missing_images = images[missing_indices]
+        missing_images = TensorUtils.to_device(
+            TensorUtils.to_float(missing_images), device
+        )
+        flattened_images = einops.rearrange(
+            missing_images, "b t h w c -> (b t) c h w"
+        )
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=device.type, enabled=cfg.train.amp
+        ):
+            dense_points, _ = splatt3r.forward_tensor(flattened_images)
+            intrinsics = estimate_intrinsics_from_dense_gaussians(
+                dense_points, flattened_images.shape[-2:]
+            )
+
+        sampled_points, _ = sample_farthest_gaussians(
+            dense_points.float(), cfg.vae.point_cloud_size
+        )
+        sampled_points = sampled_points.reshape(
+            len(missing_indices), time_steps, *sampled_points.shape[1:]
+        )
+        intrinsics = intrinsics.reshape(
+            len(missing_indices), time_steps, *intrinsics.shape[1:]
+        )
+        for local_index, batch_index in enumerate(missing_indices):
+            # Keep all entries on CPU before stacking; a mixed hit/miss batch
+            # otherwise mixes CPU cache tensors with CUDA tensors.
+            points = sampled_points[local_index].detach().to(
+                device="cpu",
+                dtype=cache.dtype if cache.enabled else sampled_points.dtype,
+            )
+            camera = intrinsics[local_index].detach().to(
+                device="cpu", dtype=torch.float32
+            )
+            cache.save(keys[batch_index], points, camera)
+            entries[batch_index] = (points, camera)
+
+    if any(entry is None for entry in entries):
+        raise RuntimeError("Gaussian cache did not produce every batch entry")
+
+    points = torch.stack([entry[0] for entry in entries], dim=0).reshape(
+        batch_size * time_steps, *entries[0][0].shape[1:]
+    )
+    intrinsics = torch.stack(
+        [entry[1] for entry in entries], dim=0
+    ).reshape(batch_size * time_steps, *entries[0][1].shape[1:])
+    return (
+        points.to(device, non_blocking=True),
+        intrinsics.to(device, non_blocking=True),
+        (height, width),
+        splatt3r,
+    )
 
 
 def vae_reconstruction_loss(model, points, intrinsics, image_size, cfg):
@@ -134,6 +292,7 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         cfg.gaussian_cache.dir,
         cfg.gaussian_cache.enabled,
         cfg.gaussian_cache.dtype,
+        max_entries=cfg.gaussian_cache.get("max_entries", None),
     )
     accum_iter = cfg.train.accum_iter
     optimizer.zero_grad()
@@ -151,36 +310,16 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         if data_iter_step >= max_batches:
             break
 
-        cached = cache.load(data_iter_step)
-        if cached is None:
-            if splatt3r is None:
-                splatt3r = Splatt3rRegressor().to(device).eval()
-
-            image1 = TensorUtils.to_device(TensorUtils.to_float(batch[0]), device)
-            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-            with torch.no_grad(), torch.amp.autocast(
-                device_type=device.type, enabled=cfg.train.amp
-            ):
-                dense_points, _ = splatt3r.forward_tensor(image1)
-                intrinsics = estimate_intrinsics_from_dense_gaussians(
-                    dense_points, image1.shape[-2:]
-                )
-
-            points, _ = sample_farthest_gaussians(
-                dense_points.float(), cfg.vae.point_cloud_size
+        points, intrinsics, image_size, splatt3r = (
+            load_or_compute_gaussian_batch(
+                batch[0], cache, splatt3r, device, cfg
             )
-            cache.save(data_iter_step, points, intrinsics)
-        else:
-            points, intrinsics = cached
-            image1 = batch[0]
-            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-        points = points.to(device, non_blocking=True)
-        intrinsics = intrinsics.to(device, non_blocking=True)
+        )
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             loss, loss_chamfer, loss_render, loss_kl = (
                 vae_reconstruction_loss(
-                    model, points, intrinsics, image1.shape[-2:], cfg
+                    model, points, intrinsics, image_size, cfg
                 )
             )
 
@@ -230,6 +369,7 @@ def evaluate(model, data_loader, device, cfg, split="val"):
         cfg.gaussian_cache.enabled,
         cfg.gaussian_cache.dtype,
         split=split,
+        max_entries=cfg.gaussian_cache.get("max_entries", None),
     )
 
     metric_logger = distributed_utils.MetricLogger(delimiter="  ")
@@ -243,36 +383,15 @@ def evaluate(model, data_loader, device, cfg, split="val"):
             and batch_index >= cfg.train.max_eval_batches
         ):
             break
-        cached = cache.load(batch_index)
-        if cached is None:
-            if splatt3r is None:
-                splatt3r = Splatt3rRegressor().to(device).eval()
-
-            image1 = TensorUtils.to_device(TensorUtils.to_float(batch[0]), device)
-            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-            with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-                dense_points, _ = splatt3r.forward_tensor(image1)
-                intrinsics = estimate_intrinsics_from_dense_gaussians(
-                    dense_points, image1.shape[-2:]
-                )
-
-            points, _ = sample_farthest_gaussians(
-                dense_points.float(), cfg.vae.point_cloud_size
+        points, intrinsics, image_size, splatt3r = (
+            load_or_compute_gaussian_batch(
+                batch[0], cache, splatt3r, device, cfg
             )
-            cache.save(batch_index, points, intrinsics)
-        else:
-            points, intrinsics = cached
-            image1 = batch[0]
-            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
-
-        points = points.to(device, non_blocking=True)
-        intrinsics = intrinsics.to(device, non_blocking=True)
+        )
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
             loss, loss_chamfer, loss_render, loss_kl = (
-                vae_reconstruction_loss(
-                    model, points, intrinsics, image1.shape[-2:], cfg
-                )
+                vae_reconstruction_loss(model, points, intrinsics, image_size, cfg)
             )
 
         metric_logger.update(loss=loss.item())

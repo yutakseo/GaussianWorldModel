@@ -489,38 +489,76 @@ class GaussianDiT(nn.Module):
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
-    @staticmethod
-    def _to_tokens(tensor):
-        return tensor.flatten(2).transpose(1, 2)
+    def forward(
+        self,
+        noisy_next_latents,
+        c_noise,
+        c_noise_cond,
+        context_latents,
+        act=None,
+    ):
+        """Denoise one Gaussian-latent frame.
 
-    def forward(self, noisy_next_obs, c_noise, c_noise_cond, obs, act=None):
-        noisy_tokens = self._to_tokens(noisy_next_obs)
-        context_tokens = self._to_tokens(obs)
-        if noisy_tokens.shape[1] != self.num_tokens:
+        Args:
+            noisy_next_latents: ``[B, N, D]`` noisy future VAE latents.
+            context_latents: ``[B, T_context, N, D]`` clean history latents.
+            c_noise: ``[B]`` EDM noise embedding input.
+            act: current transition action, ``[B, A]`` or ``[B, 1, A]``.
+
+        This is deliberately a token API.  Gaussian latents are a set of
+        points, not a fabricated ``1 x N`` image grid.
+        """
+        if noisy_next_latents.ndim != 3:
+            raise ValueError(
+                "Expected noisy Gaussian latents [B,N,D], got "
+                f"{tuple(noisy_next_latents.shape)}"
+            )
+        if context_latents.ndim != 4:
+            raise ValueError(
+                "Expected context Gaussian latents [B,T,N,D], got "
+                f"{tuple(context_latents.shape)}"
+            )
+        batch, tokens, channels = noisy_next_latents.shape
+        if context_latents.shape[0] != batch:
+            raise ValueError("Noisy and context latent batch sizes differ")
+        if context_latents.shape[1] != self.context_length:
+            raise ValueError(
+                f"Expected {self.context_length} context frames, got "
+                f"{context_latents.shape[1]}"
+            )
+        if context_latents.shape[2:] != (tokens, channels):
+            raise ValueError(
+                "Noisy and context latent token shapes differ: "
+                f"{tuple(noisy_next_latents.shape)} vs "
+                f"{tuple(context_latents.shape)}"
+            )
+        if tokens != self.num_tokens:
             raise ValueError(
                 f"Expected {self.num_tokens} Gaussian tokens, "
-                f"got {noisy_tokens.shape[1]}"
+                f"got {tokens}"
             )
-        if context_tokens.shape[1] != self.num_tokens:
+        if channels != self.latent_channels:
             raise ValueError(
-                f"Expected {self.num_tokens} context tokens, "
-                f"got {context_tokens.shape[1]}"
+                f"Expected {self.latent_channels} latent channels, "
+                f"got {channels}"
             )
-        expected_context_channels = (
-            self.context_length * self.latent_channels
+        if c_noise.ndim != 1 or c_noise.shape[0] != batch:
+            raise ValueError(
+                f"Expected noise levels [B={batch}], got {tuple(c_noise.shape)}"
+            )
+        if c_noise_cond is not None and (
+            c_noise_cond.ndim != 1 or c_noise_cond.shape[0] != batch
+        ):
+            raise ValueError(
+                "Expected conditional noise levels with shape "
+                f"[B={batch}], got {tuple(c_noise_cond.shape)}"
+            )
+
+        context_tokens = context_latents.transpose(1, 2).reshape(
+            batch, tokens, self.context_length * channels
         )
-        if context_tokens.shape[-1] != expected_context_channels:
-            raise ValueError(
-                f"Expected {expected_context_channels} context channels, "
-                f"got {context_tokens.shape[-1]}"
-            )
-        if noisy_tokens.shape[-1] != self.latent_channels:
-            raise ValueError(
-                f"Expected {self.latent_channels} noisy channels, "
-                f"got {noisy_tokens.shape[-1]}"
-            )
         x = self.input_projection(
-            torch.cat((context_tokens, noisy_tokens), dim=-1)
+            torch.cat((context_tokens, noisy_next_latents), dim=-1)
         )
 
         time_condition = self.noise_embedding(c_noise)
@@ -541,6 +579,12 @@ class GaussianDiT(nn.Module):
                     "Expected actions with shape [B,T,A], got "
                     f"{tuple(act.shape)}"
                 )
+            if act.shape[1] != 1:
+                raise ValueError(
+                    "GaussianDiT is trained on the current transition "
+                    "action only; expected [B,A] or [B,1,A], got "
+                    f"{tuple(act.shape)}"
+                )
             if act.shape[-1] != self.action_dim:
                 raise ValueError(
                     f"Expected action dimension {self.action_dim}, "
@@ -556,10 +600,7 @@ class GaussianDiT(nn.Module):
         shift, scale = self.final_modulation(time_condition).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
         x = self.output_projection(x)
-        output = x.transpose(1, 2).reshape(
-            x.shape[0], self.latent_channels, 1, self.num_tokens
-        )
-        return output, hidden_states
+        return x, hidden_states
 
 
 #################################################################################

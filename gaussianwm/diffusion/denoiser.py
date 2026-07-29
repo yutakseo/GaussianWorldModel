@@ -42,6 +42,283 @@ class DenoiserConfig:
     quantize_output: bool = True
 
 
+class GaussianLatentDenoiser(nn.Module):
+    """EDM denoiser for a sequence of Gaussian VAE latent tokens.
+
+    Unlike the legacy image denoiser, this class keeps the representation as
+    ``[batch, time, token, channel]`` throughout.  It is the middle stage of
+    the paper-aligned VAE encoder -> latent DiT -> VAE decoder pipeline.
+    """
+
+    is_gaussian_token_denoiser = True
+
+    def __init__(self, cfg: DenoiserConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        if cfg.sigma_data <= 0:
+            raise ValueError(
+                f"sigma_data must be positive, got {cfg.sigma_data}"
+            )
+        if cfg.sigma_offset_noise < 0:
+            raise ValueError("sigma_offset_noise must be non-negative")
+        if not cfg.inner_model.token_based:
+            raise ValueError(
+                "GaussianLatentDenoiser requires token_based=True"
+            )
+        self.inner_model = GaussianDiT(
+            num_tokens=cfg.inner_model.input_size,
+            in_channels=cfg.inner_model.in_channels,
+            action_dim=cfg.inner_model.action_dim,
+            hidden_size=cfg.inner_model.hidden_size,
+            depth=cfg.inner_model.depth,
+            num_heads=cfg.inner_model.num_heads,
+            mlp_ratio=cfg.inner_model.mlp_ratio,
+            context_length=cfg.inner_model.context_length,
+        )
+        self.sample_sigma_training = None
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.inner_model.parameters()).device
+
+    def setup_training(self, cfg: SigmaDistributionConfig) -> None:
+        if self.sample_sigma_training is not None:
+            raise RuntimeError("setup_training() was already called")
+        if cfg.scale < 0:
+            raise ValueError("Sigma log-normal scale must be non-negative")
+        if not 0 < cfg.sigma_min <= cfg.sigma_max:
+            raise ValueError(
+                "Expected 0 < sigma_min <= sigma_max, got "
+                f"{cfg.sigma_min} and {cfg.sigma_max}"
+            )
+
+        def sample_sigma(n: int, device: torch.device):
+            samples = torch.randn(n, device=device) * cfg.scale + cfg.loc
+            return samples.exp().clamp(cfg.sigma_min, cfg.sigma_max)
+
+        self.sample_sigma_training = sample_sigma
+
+    @staticmethod
+    def _batch_scale(values: Tensor, tensor: Tensor) -> Tensor:
+        return values.reshape(values.shape[0], *([1] * (tensor.ndim - 1)))
+
+    @staticmethod
+    def _as_batch_sigma(sigma, batch_size: int, device, dtype) -> Tensor:
+        sigma = torch.as_tensor(sigma, device=device, dtype=dtype)
+        if sigma.ndim == 0:
+            return sigma.expand(batch_size)
+        if sigma.ndim != 1 or sigma.shape[0] != batch_size:
+            raise ValueError(
+                f"Expected scalar or [B={batch_size}] sigma, got "
+                f"{tuple(sigma.shape)}"
+            )
+        return sigma
+
+    def apply_noise(
+        self, latents: Tensor, sigma: Tensor, sigma_offset_noise: float
+    ) -> Tensor:
+        if latents.ndim not in (3, 4):
+            raise ValueError(
+                "Expected Gaussian latents [B,N,D] or [B,T,N,D], got "
+                f"{tuple(latents.shape)}"
+            )
+        sigma = self._as_batch_sigma(
+            sigma, latents.shape[0], latents.device, latents.dtype
+        )
+        # Match image EDM offset noise semantics: share it across point
+        # tokens, but keep one independent offset per latent channel.
+        offset = sigma_offset_noise * torch.randn(
+            latents.shape[0], *([1] * (latents.ndim - 2)), latents.shape[-1],
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        return latents + offset + torch.randn_like(latents) * self._batch_scale(
+            sigma, latents
+        )
+
+    def compute_conditioners(
+        self, sigma: Tensor, sigma_cond: Optional[Tensor]
+    ) -> Conditioners:
+        effective_sigma = (
+            sigma**2 + self.cfg.sigma_offset_noise**2
+        ).sqrt()
+        c_in = 1 / (effective_sigma**2 + self.cfg.sigma_data**2).sqrt()
+        c_skip = self.cfg.sigma_data**2 / (
+            self.cfg.sigma_data**2 + effective_sigma**2
+        )
+        c_out = effective_sigma * c_skip.sqrt()
+        c_noise = (
+            effective_sigma.clamp_min(torch.finfo(sigma.dtype).tiny).log() / 4
+        )
+        if sigma_cond is None:
+            c_noise_cond = None
+        else:
+            effective_sigma_cond = (
+                sigma_cond**2 + self.cfg.sigma_offset_noise**2
+            ).sqrt()
+            c_noise_cond = (
+                effective_sigma_cond.clamp_min(
+                    torch.finfo(sigma_cond.dtype).tiny
+                ).log()
+                / 4
+            )
+        return Conditioners(c_in, c_out, c_skip, c_noise, c_noise_cond)
+
+    def compute_model_output(
+        self,
+        noisy_next_latents: Tensor,
+        context_latents: Tensor,
+        action: Optional[Tensor],
+        conditioners: Conditioners,
+    ) -> Tuple[Tensor, Tensor]:
+        output, hidden_states = self.inner_model(
+            noisy_next_latents
+            * self._batch_scale(conditioners.c_in, noisy_next_latents),
+            conditioners.c_noise,
+            conditioners.c_noise_cond,
+            context_latents / self.cfg.sigma_data,
+            action,
+        )
+        return output, hidden_states
+
+    def forward(
+        self,
+        batch_latents: Tensor,
+        batch_action: Tensor,
+        batch_mask_padding: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Train one-step conditional EDM on ``[B,T,N,D]`` VAE latents."""
+        if self.sample_sigma_training is None:
+            raise RuntimeError("Call setup_training() before forward()")
+        if batch_latents.ndim != 4:
+            raise ValueError(
+                "Expected latents [B,T,N,D], got "
+                f"{tuple(batch_latents.shape)}"
+            )
+        if batch_action.ndim != 3:
+            raise ValueError(
+                "Expected actions [B,T,A], got "
+                f"{tuple(batch_action.shape)}"
+            )
+        batch_size, time_steps, num_tokens, latent_dim = batch_latents.shape
+        if (num_tokens, latent_dim) != (
+            self.inner_model.num_tokens,
+            self.inner_model.latent_channels,
+        ):
+            raise ValueError(
+                "Latent shape does not match GaussianDiT: expected "
+                f"[B,T,{self.inner_model.num_tokens},"
+                f"{self.inner_model.latent_channels}], got "
+                f"{tuple(batch_latents.shape)}"
+            )
+        context_length = self.cfg.inner_model.context_length
+        if context_length <= 0 or time_steps <= context_length:
+            raise ValueError(
+                f"Need T > context_length > 0, got T={time_steps}, "
+                f"context={context_length}"
+            )
+        if batch_action.shape[0] != batch_size or batch_action.shape[1] < time_steps - 1:
+            raise ValueError(
+                "Need actions [B,T-1,A] aligned with latent transitions"
+            )
+        if batch_mask_padding is not None:
+            if batch_mask_padding.shape != (batch_size, time_steps):
+                raise ValueError(
+                    "padding mask must have shape "
+                    f"{(batch_size, time_steps)}, got "
+                    f"{tuple(batch_mask_padding.shape)}"
+                )
+            batch_mask_padding = batch_mask_padding.to(torch.bool)
+
+        loss = batch_latents.new_zeros(())
+        loss_steps = 0
+        for step in range(time_steps - context_length):
+            context = batch_latents[:, step : step + context_length]
+            target_latents = batch_latents[:, step + context_length]
+            action = batch_action[:, step + context_length - 1].unsqueeze(1)
+            mask = (
+                batch_mask_padding[:, step + context_length]
+                if batch_mask_padding is not None
+                else None
+            )
+
+            if self.cfg.noise_previous_obs:
+                sigma_cond = self.sample_sigma_training(batch_size, self.device)
+                context = self.apply_noise(
+                    context, sigma_cond, self.cfg.sigma_offset_noise
+                )
+            else:
+                sigma_cond = None
+
+            sigma = self.sample_sigma_training(batch_size, self.device)
+            noisy_target = self.apply_noise(
+                target_latents, sigma, self.cfg.sigma_offset_noise
+            )
+            conditioners = self.compute_conditioners(sigma, sigma_cond)
+            model_output, _ = self.compute_model_output(
+                noisy_target, context, action, conditioners
+            )
+            target = (
+                target_latents
+                - self._batch_scale(conditioners.c_skip, noisy_target)
+                * noisy_target
+            ) / self._batch_scale(conditioners.c_out, noisy_target)
+
+            if mask is None:
+                loss = loss + F.mse_loss(model_output, target)
+                loss_steps += 1
+            elif mask.any():
+                weighted = (model_output - target).square() * mask.view(
+                    batch_size, 1, 1
+                )
+                loss = loss + weighted.sum() / (
+                    mask.sum() * num_tokens * latent_dim + 1e-8
+                )
+                loss_steps += 1
+
+        if loss_steps == 0:
+            return batch_latents.sum() * 0.0
+        return loss / loss_steps
+
+    @torch.no_grad()
+    def denoise(
+        self,
+        noisy_next_latents: Tensor,
+        sigma: Tensor,
+        sigma_cond: Optional[Tensor],
+        context_latents: Tensor,
+        action: Optional[Tensor],
+    ) -> Tensor:
+        if noisy_next_latents.ndim != 3:
+            raise ValueError(
+                "Expected noisy latents [B,N,D], got "
+                f"{tuple(noisy_next_latents.shape)}"
+            )
+        sigma = self._as_batch_sigma(
+            sigma,
+            noisy_next_latents.shape[0],
+            noisy_next_latents.device,
+            noisy_next_latents.dtype,
+        )
+        if sigma_cond is not None:
+            sigma_cond = self._as_batch_sigma(
+                sigma_cond,
+                noisy_next_latents.shape[0],
+                noisy_next_latents.device,
+                noisy_next_latents.dtype,
+            )
+        conditioners = self.compute_conditioners(sigma, sigma_cond)
+        model_output, _ = self.compute_model_output(
+            noisy_next_latents, context_latents, action, conditioners
+        )
+        return (
+            self._batch_scale(conditioners.c_skip, noisy_next_latents)
+            * noisy_next_latents
+            + self._batch_scale(conditioners.c_out, noisy_next_latents)
+            * model_output
+        )
+
+
 class Denoiser(nn.Module):
     def __init__(self, cfg: DenoiserConfig) -> None:
         super().__init__()
@@ -55,31 +332,24 @@ class Denoiser(nn.Module):
         self.is_upsampler = cfg.upsampling_factor is not None
         cfg.inner_model.is_upsampler = self.is_upsampler
         if cfg.inner_model.token_based:
-            self.inner_model = GaussianDiT(
-                num_tokens=cfg.inner_model.input_size,
-                in_channels=cfg.inner_model.in_channels,
-                action_dim=cfg.inner_model.action_dim,
-                hidden_size=cfg.inner_model.hidden_size,
-                depth=cfg.inner_model.depth,
-                num_heads=cfg.inner_model.num_heads,
-                mlp_ratio=cfg.inner_model.mlp_ratio,
-                context_length=cfg.inner_model.context_length,
+            raise ValueError(
+                "Use GaussianLatentDenoiser for [B,T,N,D] Gaussian VAE "
+                "latents; Denoiser is reserved for image tensors."
             )
-        else:
-            self.inner_model = DiT(
-                input_size=cfg.inner_model.input_size,
-                patch_size=cfg.inner_model.patch_size,
-                in_channels=cfg.inner_model.in_channels
-                * (cfg.inner_model.context_length + 1),
-                action_dim=cfg.inner_model.action_dim,
-                hidden_size=cfg.inner_model.hidden_size,
-                depth=cfg.inner_model.depth,
-                num_heads=cfg.inner_model.num_heads,
-                mlp_ratio=cfg.inner_model.mlp_ratio,
-                class_dropout_prob=cfg.inner_model.class_dropout_prob,
-                learn_sigma=cfg.inner_model.learn_sigma,
-                context_length=cfg.inner_model.context_length,
-            )
+        self.inner_model = DiT(
+            input_size=cfg.inner_model.input_size,
+            patch_size=cfg.inner_model.patch_size,
+            in_channels=cfg.inner_model.in_channels
+            * (cfg.inner_model.context_length + 1),
+            action_dim=cfg.inner_model.action_dim,
+            hidden_size=cfg.inner_model.hidden_size,
+            depth=cfg.inner_model.depth,
+            num_heads=cfg.inner_model.num_heads,
+            mlp_ratio=cfg.inner_model.mlp_ratio,
+            class_dropout_prob=cfg.inner_model.class_dropout_prob,
+            learn_sigma=cfg.inner_model.learn_sigma,
+            context_length=cfg.inner_model.context_length,
+        )
         self.sample_sigma_training = None
         # self.reward_head = nn.Sequential(
         #     nn.LayerNorm(cfg.inner_model.hidden_size),
@@ -119,19 +389,27 @@ class Denoiser(nn.Module):
         return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
 
     def compute_conditioners(self, sigma: Tensor, sigma_cond: Optional[Tensor]) -> Conditioners:
-        sigma = (sigma**2 + self.cfg.sigma_offset_noise**2).sqrt()
-        c_in = 1 / (sigma**2 + self.cfg.sigma_data**2).sqrt()
-        c_skip = self.cfg.sigma_data**2 / (sigma**2 + self.cfg.sigma_data**2)
-        c_out = sigma * c_skip.sqrt()
-        c_noise = sigma.clamp_min(torch.finfo(sigma.dtype).tiny).log() / 4
-        c_noise_cond = (
-            sigma_cond.clamp_min(
-                torch.finfo(sigma_cond.dtype).tiny
-            ).log()
-            / 4
-            if sigma_cond is not None
-            else None
+        effective_sigma = (sigma**2 + self.cfg.sigma_offset_noise**2).sqrt()
+        c_in = 1 / (effective_sigma**2 + self.cfg.sigma_data**2).sqrt()
+        c_skip = self.cfg.sigma_data**2 / (
+            effective_sigma**2 + self.cfg.sigma_data**2
         )
+        c_out = effective_sigma * c_skip.sqrt()
+        c_noise = (
+            effective_sigma.clamp_min(torch.finfo(sigma.dtype).tiny).log() / 4
+        )
+        if sigma_cond is None:
+            c_noise_cond = None
+        else:
+            effective_sigma_cond = (
+                sigma_cond**2 + self.cfg.sigma_offset_noise**2
+            ).sqrt()
+            c_noise_cond = (
+                effective_sigma_cond.clamp_min(
+                    torch.finfo(sigma_cond.dtype).tiny
+                ).log()
+                / 4
+            )
         return Conditioners(
             c_in=add_dims(c_in, 4),
             c_out=add_dims(c_out, 4),

@@ -1,5 +1,4 @@
 import os
-import math
 from pathlib import Path
 
 import time
@@ -34,12 +33,24 @@ class GaussianPredictor(nn.Module):
         self.args = args
         self.device = device
 
-        # Initialize diffusion sampler
+        uses_gaussian_tokens = (
+            args.observation.use_gs and args.vae.use_vae
+        )
+
+        # Initialize the paper's one-step EDM dynamics model.
         denoiser_config = DenoiserConfig(
             inner_model=InnerModelConfig(
-                input_size=args.model.input_size,
-                patch_size=args.model.patch_size,
-                in_channels=args.model.in_channels,
+                input_size=(
+                    args.vae.num_latents
+                    if uses_gaussian_tokens
+                    else args.model.input_size
+                ),
+                patch_size=1 if uses_gaussian_tokens else args.model.patch_size,
+                in_channels=(
+                    args.vae.latent_dim
+                    if uses_gaussian_tokens
+                    else args.model.in_channels
+                ),
                 action_dim=args.action_dim,
                 hidden_size=args.model.hidden_size,
                 depth=args.model.depth,
@@ -48,6 +59,7 @@ class GaussianPredictor(nn.Module):
                 class_dropout_prob=args.model.class_dropout_prob,
                 learn_sigma=args.model.learn_sigma,
                 context_length=args.context_length,
+                token_based=uses_gaussian_tokens,
             ),
             sigma_data=args.diffusion.sigma_data,
             sigma_offset_noise=args.diffusion.sigma_offset_noise,
@@ -55,9 +67,6 @@ class GaussianPredictor(nn.Module):
             # Gaussian parameters are continuous physical values. Applying
             # the legacy RGB clamp/8-bit quantization destroys them.
             quantize_output=not args.observation.use_gs,
-            autoregressive_training=args.diffusion.get(
-                "autoregressive_training", False
-            ),
         )
         reward_model_config = RewardModelConfig(
                 lstm_dim=args.model.hidden_size,
@@ -94,6 +103,12 @@ class GaussianPredictor(nn.Module):
                 vae_checkpoint = torch.load(
                     args.vae.pretrained_path, map_location="cpu"
                 )
+                if vae_checkpoint.get("format_version") != 2:
+                    raise ValueError(
+                        "The VAE checkpoint predates the paper-aligned "
+                        "rendering-loss format and cannot be reused. "
+                        "Retrain the VAE before training or running the DiT."
+                    )
                 checkpoint_args = vae_checkpoint.get("args", {})
                 checkpoint_vae = (
                     checkpoint_args.get("vae", {})
@@ -113,16 +128,33 @@ class GaussianPredictor(nn.Module):
                         f"({decoder_num_queries}) does not match checkpoint "
                         f"metadata ({checkpoint_queries})."
                     )
+                expected_vae = {
+                    "model_dim": args.vae.model_dim,
+                    "num_latents": args.vae.num_latents,
+                    "latent_dim": args.vae.latent_dim,
+                    "use_kl": args.vae.use_kl,
+                }
+                for name, expected in expected_vae.items():
+                    actual = (
+                        checkpoint_vae.get(name)
+                        if hasattr(checkpoint_vae, "get")
+                        else None
+                    )
+                    if actual != expected:
+                        raise ValueError(
+                            f"Configured VAE {name} ({expected}) does not "
+                            f"match checkpoint metadata ({actual})."
+                        )
             self.vae = create_autoencoder(
                 depth=args.vae.vae_depth,
-                # dim=self.gaussian_feature_dim,
-                dim=self.latent_dim,
+                dim=args.vae.model_dim,
                 M=self.num_latents,
                 latent_dim=self.latent_dim,
                 output_dim=self.gaussian_feature_dim,
                 N=args.observation.point_cloud_size,
                 deterministic=not args.vae.use_kl,
                 decoder_num_queries=decoder_num_queries,
+                min_scale=args.vae.min_scale,
             ).to(device)
             if vae_checkpoint is not None:
                 self.vae.load_state_dict(vae_checkpoint["model"])
@@ -131,25 +163,15 @@ class GaussianPredictor(nn.Module):
             cprint(f"[VAE] Total parameters: {sum(p.numel() for p in self.vae.parameters())/1e6}M", 'yellow')
 
         # Modify denoiser config for latent space if using either component
-        if args.observation.use_gs:
+        if args.observation.use_gs and not args.vae.use_vae:
             denoiser_config.inner_model.in_channels = 14
             if args.reward.use_reward_model:
                 reward_model_config.img_channels = 14
         if args.vae.use_vae:
-            denoiser_config.inner_model.in_channels = args.vae.latent_dim
-            denoiser_config.inner_model.input_size = args.vae.num_latents
-            denoiser_config.inner_model.patch_size = 1
-            
-            # Pre-compute spatial dimensions for reshaping when using VAE
-            self.nh = int(math.sqrt(args.vae.num_latents))
-            self.nw = self.nh
-            if self.nh * self.nw != args.vae.num_latents:
-                raise ValueError(
-                    "The public 2D DiT requires a square number of VAE "
-                    f"latents, got {args.vae.num_latents}."
-                )
-            # Update input_size to spatial dimensions
-            denoiser_config.inner_model.input_size = self.nh
+            # Gaussian VAE embeddings are a set of latent points, not a
+            # fabricated square image grid.
+            self.nh = 1
+            self.nw = args.vae.num_latents
 
             if args.reward.use_reward_model:
                 reward_model_config.img_size = self.nh
@@ -391,7 +413,11 @@ class GaussianPredictor(nn.Module):
     def save_snapshot(self, workdir, suffix='', optimizer=None, step=None):
         # Save unwrapped model if using DDP
         model_to_save = self.module if isinstance(self, DDP) else self
-        checkpoint = {"model": model_to_save.model.state_dict()}
+        checkpoint = {
+            "model": model_to_save.model.state_dict(),
+            "format_version": 2,
+            "architecture": model_to_save._architecture_metadata(),
+        }
         if optimizer is not None:
             checkpoint["optimizer"] = optimizer.state_dict()
         if step is not None:
@@ -414,9 +440,42 @@ class GaussianPredictor(nn.Module):
             checkpoint_path,
             map_location=f'cuda:{dist.get_rank()}' if dist.is_initialized() else 'cpu',
         )
+        architecture = checkpoint.get("architecture")
+        expected_architecture = self._architecture_metadata()
+        if architecture != expected_architecture:
+            raise ValueError(
+                "DiT checkpoint architecture does not match the configured "
+                "paper-aligned model. Expected "
+                f"{expected_architecture}, got {architecture}. "
+                "Legacy 2D-grid checkpoints must be retrained."
+            )
         # Backward compatibility with checkpoints that contain only model weights.
         state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
         self.model.load_state_dict(state_dict)
         if optimizer is not None and "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         return checkpoint.get("step") if "model" in checkpoint else None
+
+    def _architecture_metadata(self):
+        return {
+            "representation": (
+                "gaussian_tokens"
+                if self.args.observation.use_gs and self.args.vae.use_vae
+                else "image"
+            ),
+            "num_latents": (
+                int(self.args.vae.num_latents)
+                if self.args.vae.use_vae
+                else None
+            ),
+            "latent_dim": (
+                int(self.args.vae.latent_dim)
+                if self.args.vae.use_vae
+                else None
+            ),
+            "context_length": int(self.args.context_length),
+            "action_dim": int(self.args.action_dim),
+            "hidden_size": int(self.args.model.hidden_size),
+            "depth": int(self.args.model.depth),
+            "num_heads": int(self.args.model.num_heads),
+        }

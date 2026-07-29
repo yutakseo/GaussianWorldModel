@@ -19,9 +19,11 @@ from termcolor import cprint
 from gaussianwm.gwm_predictor import GaussianPredictor
 from gaussianwm.processor.regressor import gaussian_feature_to_dim
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
+from gaussianwm.rendering import (
+    estimate_intrinsics_from_dense_gaussians,
+    render_gaussians,
+)
 from gaussianwm.util.runtime import resolve_path, seed_everything
-from src.pixelsplat_src.cuda_splatting import render_cuda
-from utils.geometry import build_covariance
 
 
 def save_rollout_video(
@@ -59,86 +61,14 @@ def decode_gaussians(model, latent):
 
 
 def estimate_intrinsics_from_gaussians(gaussians, source_shape):
-    """Estimate normalized pinhole intrinsics from dense pixel-aligned points.
-
-    Splatt3r emits one Gaussian per source pixel in the source-camera frame.
-    DROID's public RGB stream is unposed and does not expose calibration, so
-    the point/pixel correspondences are a better rendering calibration than a
-    hard-coded field of view.
-    """
-    height, width = source_shape
-    means = gaussians[..., :3].reshape(height, width, 3).float()
-    y, x = torch.meshgrid(
-        (
-            torch.arange(height, device=means.device, dtype=means.dtype) + 0.5
-        ) / height,
-        (
-            torch.arange(width, device=means.device, dtype=means.dtype) + 0.5
-        ) / width,
-        indexing="ij",
-    )
-    z = means[..., 2]
-    qx = means[..., 0] / z.clamp_min(1e-6)
-    qy = means[..., 1] / z.clamp_min(1e-6)
-    valid = torch.isfinite(means).all(dim=-1) & (z > 1e-4)
-
-    def fit_focal(q, pixel):
-        mask = valid & torch.isfinite(q) & (q.abs() > 1e-4)
-        numerator = (q[mask] * (pixel[mask] - 0.5)).sum()
-        denominator = q[mask].square().sum().clamp_min(1e-8)
-        return (numerator / denominator).abs().clamp(0.25, 4.0)
-
-    intrinsics = torch.eye(
-        3, device=means.device, dtype=means.dtype
-    )
-    intrinsics[0, 0] = fit_focal(qx, x)
-    intrinsics[1, 1] = fit_focal(qy, y)
-    intrinsics[0, 2] = 0.5
-    intrinsics[1, 2] = 0.5
-    return intrinsics
+    return estimate_intrinsics_from_dense_gaussians(
+        gaussians, source_shape
+    )[0]
 
 
 def render_gaussian_tensor(gaussians, image_size, intrinsics):
     """Rasterize an already-decoded [N, 14] Gaussian tensor."""
-    decoded = gaussians.unsqueeze(0) if gaussians.ndim == 2 else gaussians
-    intrinsics = intrinsics.unsqueeze(0) if intrinsics.ndim == 2 else intrinsics
-    intrinsics = intrinsics.to(device=decoded.device, dtype=decoded.dtype)
-
-    means = decoded[..., 0:3].contiguous()
-    scales = decoded[..., 3:6].clamp_min(1e-5)
-    rotations = decoded[..., 6:10]
-    rotations = rotations / rotations.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    sh = decoded[..., 10:13, None].contiguous()
-    opacities = decoded[..., 13].clamp(0.0, 1.0)
-    covariances = build_covariance(scales, rotations).contiguous()
-
-    batch_size = decoded.shape[0]
-    extrinsics = torch.eye(
-        4, device=decoded.device, dtype=decoded.dtype
-    ).unsqueeze(0).repeat(batch_size, 1, 1)
-    near = torch.full(
-        (batch_size,), 0.1, device=decoded.device, dtype=decoded.dtype
-    )
-    far = torch.full(
-        (batch_size,), 1000.0, device=decoded.device, dtype=decoded.dtype
-    )
-    background = torch.zeros(
-        batch_size, 3, device=decoded.device, dtype=decoded.dtype
-    )
-    rendered = render_cuda(
-        extrinsics,
-        intrinsics,
-        near,
-        far,
-        image_size,
-        background,
-        means,
-        covariances,
-        sh,
-        opacities,
-        scale_invariant=True,
-        use_sh=True,
-    )[0]
+    rendered = render_gaussians(gaussians, image_size, intrinsics)[0]
     return (
         rendered.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255
     ).astype(np.uint8)

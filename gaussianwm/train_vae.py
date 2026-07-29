@@ -17,10 +17,14 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import einops
 from pytorch3d.loss import chamfer_distance
-from pytorch3d.ops import knn_gather, knn_points, sample_farthest_points as fps
+from pytorch3d.ops import sample_farthest_points as fps
 
 from gaussianwm.processor.regressor import Splatt3rRegressor
 from gaussianwm.encoder.models_ae import create_autoencoder
+from gaussianwm.rendering import (
+    estimate_intrinsics_from_dense_gaussians,
+    render_gaussians,
+)
 from gaussianwm.util import distributed_utils, lr_utils
 from gaussianwm.util import tensor_utils as TensorUtils
 from gaussianwm.processor.datasets import build_gaussian_splatting_reconstruction_dataset
@@ -29,9 +33,10 @@ from gaussianwm.util.plot_training_metrics import render as render_loss_plot
 
 
 class GaussianFeatureCache:
-    """Disk cache for post-Splatt3r, post-FPS point clouds."""
+    """Versioned cache for sampled Gaussians and camera calibration."""
 
     _DTYPES = {"float16": torch.float16, "float32": torch.float32}
+    VERSION = 3
 
     def __init__(self, cache_dir, enabled, dtype, split="train"):
         self.enabled = enabled
@@ -49,21 +54,35 @@ class GaussianFeatureCache:
         path = self._path(batch_index)
         if not path.is_file():
             return None
-        return torch.load(path, map_location="cpu", weights_only=True)
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or payload.get("version") != self.VERSION:
+            return None
+        if "points" not in payload or "intrinsics" not in payload:
+            return None
+        return payload["points"], payload["intrinsics"]
 
-    def save(self, batch_index, points):
+    def save(self, batch_index, points, intrinsics):
         if not self.enabled:
             return
         path = self._path(batch_index)
-        if path.is_file():
-            return
         tmp_path = path.with_suffix(".tmp")
-        torch.save(points.detach().to(device="cpu", dtype=self.dtype).contiguous(), tmp_path)
+        torch.save(
+            {
+                "version": self.VERSION,
+                "points": points.detach()
+                .to(device="cpu", dtype=self.dtype)
+                .contiguous(),
+                "intrinsics": intrinsics.detach()
+                .to(device="cpu", dtype=torch.float32)
+                .contiguous(),
+            },
+            tmp_path,
+        )
         os.replace(tmp_path, path)
 
 
-def vae_reconstruction_loss(model, points, cfg):
-    """Train the same latent-only decoder path used at inference."""
+def vae_reconstruction_loss(model, points, intrinsics, image_size, cfg):
+    """Paper Eq. (4): center Chamfer plus differentiable rendering L1."""
     encoded = model.encode(points)
     if isinstance(encoded, tuple):
         kl, latents = encoded
@@ -80,23 +99,24 @@ def vae_reconstruction_loss(model, points, cfg):
         batch_reduction="mean",
         point_reduction="mean",
     )
-    nearest = knn_points(
-        reconstructed[..., :3], targets[..., :3], K=1
-    )
-    target_features = knn_gather(
-        targets[..., 3:], nearest.idx
-    ).squeeze(2)
-    loss_features = F.smooth_l1_loss(
-        reconstructed[..., 3:], target_features
-    )
+    # The CUDA Gaussian rasterizer is differentiable but float32-only.
+    with torch.autocast(device_type=points.device.type, enabled=False):
+        rendered_reconstruction = render_gaussians(
+            reconstructed.float(), image_size, intrinsics.float()
+        )
+        with torch.no_grad():
+            rendered_target = render_gaussians(
+                targets.float(), image_size, intrinsics.float()
+            )
+    loss_render = F.l1_loss(rendered_reconstruction, rendered_target)
 
     loss = (
         cfg.vae.loss.chamfer_weight * loss_chamfer
-        + cfg.vae.loss.feature_weight * loss_features
+        + cfg.vae.loss.render_weight * loss_render
     )
     if loss_kl is not None:
         loss = loss + cfg.vae.loss.kl_weight * loss_kl
-    return loss, loss_chamfer, loss_features, loss_kl
+    return loss, loss_chamfer, loss_render, loss_kl
 
 
 def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
@@ -120,6 +140,8 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         cprint(f'log_dir: {log_writer.log_dir}', 'green')
 
     max_batches = len(data_loader)
+    if cfg.train.max_batches_per_epoch is not None:
+        max_batches = min(max_batches, cfg.train.max_batches_per_epoch)
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # DroidDataset is backed by an RLDS pipeline whose source repeats
         # indefinitely.  __len__ defines the intended epoch boundary, so stop
@@ -127,8 +149,8 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
         if data_iter_step >= max_batches:
             break
 
-        points = cache.load(data_iter_step)
-        if points is None:
+        cached = cache.load(data_iter_step)
+        if cached is None:
             if splatt3r is None:
                 splatt3r = Splatt3rRegressor().to(device).eval()
 
@@ -137,15 +159,27 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
             with torch.no_grad(), torch.amp.autocast(
                 device_type=device.type, enabled=cfg.train.amp
             ):
-                points, _ = splatt3r.forward_tensor(image1)
+                dense_points, _ = splatt3r.forward_tensor(image1)
+                intrinsics = estimate_intrinsics_from_dense_gaussians(
+                    dense_points, image1.shape[-2:]
+                )
 
-            points, _ = fps(points.float(), K=cfg.vae.point_cloud_size)
-            cache.save(data_iter_step, points)
+            points, _ = fps(
+                dense_points.float(), K=cfg.vae.point_cloud_size
+            )
+            cache.save(data_iter_step, points, intrinsics)
+        else:
+            points, intrinsics = cached
+            image1 = batch[0]
+            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
         points = points.to(device, non_blocking=True)
+        intrinsics = intrinsics.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-            loss, loss_chamfer, loss_features, loss_kl = (
-                vae_reconstruction_loss(model, points, cfg)
+            loss, loss_chamfer, loss_render, loss_kl = (
+                vae_reconstruction_loss(
+                    model, points, intrinsics, image1.shape[-2:], cfg
+                )
             )
 
         loss_value = loss.item()
@@ -165,7 +199,7 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch, loss_scaler,
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_chamfer=loss_chamfer.item())
-        metric_logger.update(loss_features=loss_features.item())
+        metric_logger.update(loss_render=loss_render.item())
 
         if loss_kl is not None:
             metric_logger.update(loss_kl=loss_kl.item())
@@ -201,29 +235,46 @@ def evaluate(model, data_loader, device, cfg, split="val"):
     for batch_index, batch in enumerate(
         tqdm(metric_logger.log_every(data_loader, 50, header), desc="Evaluation")
     ):
-        points = cache.load(batch_index)
-        if points is None:
+        if (
+            cfg.train.max_eval_batches is not None
+            and batch_index >= cfg.train.max_eval_batches
+        ):
+            break
+        cached = cache.load(batch_index)
+        if cached is None:
             if splatt3r is None:
                 splatt3r = Splatt3rRegressor().to(device).eval()
 
             image1 = TensorUtils.to_device(TensorUtils.to_float(batch[0]), device)
             image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
             with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-                points, _ = splatt3r.forward_tensor(image1)
+                dense_points, _ = splatt3r.forward_tensor(image1)
+                intrinsics = estimate_intrinsics_from_dense_gaussians(
+                    dense_points, image1.shape[-2:]
+                )
 
-            points, _ = fps(points.float(), K=cfg.vae.point_cloud_size)
-            cache.save(batch_index, points)
+            points, _ = fps(
+                dense_points.float(), K=cfg.vae.point_cloud_size
+            )
+            cache.save(batch_index, points, intrinsics)
+        else:
+            points, intrinsics = cached
+            image1 = batch[0]
+            image1 = einops.rearrange(image1, 'b t h w c -> (b t) c h w')
 
         points = points.to(device, non_blocking=True)
+        intrinsics = intrinsics.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=cfg.train.amp):
-            loss, loss_chamfer, loss_features, loss_kl = (
-                vae_reconstruction_loss(model, points, cfg)
+            loss, loss_chamfer, loss_render, loss_kl = (
+                vae_reconstruction_loss(
+                    model, points, intrinsics, image1.shape[-2:], cfg
+                )
             )
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(loss_chamfer=loss_chamfer.item())
-        metric_logger.update(loss_features=loss_features.item())
+        metric_logger.update(loss_render=loss_render.item())
 
         if loss_kl is not None:
             metric_logger.update(loss_kl=loss_kl.item())
@@ -298,13 +349,14 @@ def main(cfg: DictConfig):
     )
     model = create_autoencoder(
         depth=cfg.vae.vae_depth,
-        dim=cfg.vae.latent_dim,
+        dim=cfg.vae.model_dim,
         M=cfg.vae.num_latents,
         latent_dim=cfg.vae.latent_dim,
         output_dim=cfg.vae.output_dim,
         N=cfg.vae.point_cloud_size,
         deterministic=not cfg.vae.use_kl,
         decoder_num_queries=cfg.vae.get("decoder_num_queries", None),
+        min_scale=cfg.vae.min_scale,
     ).to(device)
 
     model_without_ddp = model
@@ -333,7 +385,7 @@ def main(cfg: DictConfig):
     optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=cfg.optimizer.lr)
     loss_scaler = NativeScaler()
     logger.info(
-        "Criterion: center Chamfer + nearest Gaussian feature SmoothL1"
+        "Criterion: center Chamfer + differentiable Gaussian rendering L1"
     )
 
     distributed_utils.load_model(args=cfg, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)

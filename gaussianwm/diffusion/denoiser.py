@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # from data import Batch
-from .models import DiT, InnerModelConfig
+from .models import DiT, GaussianDiT, InnerModelConfig
 from typing import Tuple, Dict, Any
 
 
@@ -40,7 +40,6 @@ class DenoiserConfig:
     noise_previous_obs: bool
     upsampling_factor: Optional[int] = None
     quantize_output: bool = True
-    autoregressive_training: bool = False
 
 
 class Denoiser(nn.Module):
@@ -49,19 +48,32 @@ class Denoiser(nn.Module):
         self.cfg = cfg
         self.is_upsampler = cfg.upsampling_factor is not None
         cfg.inner_model.is_upsampler = self.is_upsampler
-        self.inner_model = DiT(
-            input_size=cfg.inner_model.input_size,
-            patch_size=cfg.inner_model.patch_size,
-            in_channels=cfg.inner_model.in_channels * (cfg.inner_model.context_length + 1), # horizon=1
-            action_dim=cfg.inner_model.action_dim,
-            hidden_size=cfg.inner_model.hidden_size,
-            depth=cfg.inner_model.depth,
-            num_heads=cfg.inner_model.num_heads,
-            mlp_ratio=cfg.inner_model.mlp_ratio,
-            class_dropout_prob=cfg.inner_model.class_dropout_prob,
-            learn_sigma=cfg.inner_model.learn_sigma,
-            context_length=cfg.inner_model.context_length,
-        )
+        if cfg.inner_model.token_based:
+            self.inner_model = GaussianDiT(
+                num_tokens=cfg.inner_model.input_size,
+                in_channels=cfg.inner_model.in_channels,
+                action_dim=cfg.inner_model.action_dim,
+                hidden_size=cfg.inner_model.hidden_size,
+                depth=cfg.inner_model.depth,
+                num_heads=cfg.inner_model.num_heads,
+                mlp_ratio=cfg.inner_model.mlp_ratio,
+                context_length=cfg.inner_model.context_length,
+            )
+        else:
+            self.inner_model = DiT(
+                input_size=cfg.inner_model.input_size,
+                patch_size=cfg.inner_model.patch_size,
+                in_channels=cfg.inner_model.in_channels
+                * (cfg.inner_model.context_length + 1),
+                action_dim=cfg.inner_model.action_dim,
+                hidden_size=cfg.inner_model.hidden_size,
+                depth=cfg.inner_model.depth,
+                num_heads=cfg.inner_model.num_heads,
+                mlp_ratio=cfg.inner_model.mlp_ratio,
+                class_dropout_prob=cfg.inner_model.class_dropout_prob,
+                learn_sigma=cfg.inner_model.learn_sigma,
+                context_length=cfg.inner_model.context_length,
+            )
         self.sample_sigma_training = None
         # self.reward_head = nn.Sequential(
         #     nn.LayerNorm(cfg.inner_model.hidden_size),
@@ -186,14 +198,6 @@ class Denoiser(nn.Module):
                 loss += F.mse_loss(model_output, target)
             loss_steps += 1
 
-            if self.cfg.autoregressive_training:
-                # Optional rollout fine-tuning. Base training uses clean
-                # ground-truth contexts (teacher forcing).
-                with torch.no_grad():
-                    denoised = self.wrap_model_output(
-                        noisy_obs, model_output, cs
-                    )
-                    all_obs[:, n + i] = denoised
             # reward_preds.append(self.reward_head(hidden_states[-1].mean(dim=1)))
 
         if loss_steps == 0:

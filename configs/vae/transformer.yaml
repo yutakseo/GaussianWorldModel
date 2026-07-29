@@ -1,19 +1,20 @@
 # Configuration for Autoencoder models
 
 # Default model parameters
-name: ae_d64_m64
+name: gaussian_vae_d64_m512
 point_cloud_size: 2048
 
 use_vae: true
 vae_depth: 4
-num_latents: 64 # 8x8
+model_dim: 512
+num_latents: 512
 latent_dim: 64
-# Set to 2048 for dense reconstruction. Null preserves compatibility with
-# legacy checkpoints whose decoder emitted one Gaussian per latent token.
+# The paper's mirrored decoder reconstructs one Gaussian per latent point.
 decoder_num_queries: null
 output_dim: 14
-use_kl: false
+use_kl: true
+min_scale: 1.0e-5
 loss:
   chamfer_weight: 1.0
-  feature_weight: 1.0
+  render_weight: 1.0
   kl_weight: 1.0e-3

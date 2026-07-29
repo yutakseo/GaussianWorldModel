@@ -12,11 +12,10 @@ if [[ $# -gt 0 ]]; then
 fi
 
 case "${MODE}" in
-    vae|dit|all|rollout) ;;
+    vae|dit|all) ;;
     *)
         echo "Usage:" >&2
         echo "  $0 [vae|dit|all] [Hydra overrides ...]" >&2
-        echo "  $0 rollout CHECKPOINT FINAL_STEP [Hydra overrides ...]" >&2
         exit 2
         ;;
 esac
@@ -89,31 +88,6 @@ train_dit() {
         use_wandb=false \
         "${EXTRA_OVERRIDES[@]}"
 }
-
-if [[ "${MODE}" == "rollout" ]]; then
-    if [[ ${#EXTRA_OVERRIDES[@]} -lt 2 ]]; then
-        echo "Usage: $0 rollout CHECKPOINT FINAL_STEP [Hydra overrides ...]" >&2
-        exit 2
-    fi
-    DIT_CHECKPOINT="${EXTRA_OVERRIDES[0]}"
-    FINAL_STEP="${EXTRA_OVERRIDES[1]}"
-    EXTRA_OVERRIDES=("${EXTRA_OVERRIDES[@]:2}")
-    if [[ ! -f "${DIT_CHECKPOINT}" ]]; then
-        echo "DiT checkpoint not found: ${DIT_CHECKPOINT}" >&2
-        exit 1
-    fi
-    if ! [[ "${FINAL_STEP}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "FINAL_STEP must be a positive integer: ${FINAL_STEP}" >&2
-        exit 2
-    fi
-    EXTRA_OVERRIDES+=(
-        "resume=${DIT_CHECKPOINT}"
-        "train.max_steps=${FINAL_STEP}"
-        "world_model.diffusion.autoregressive_training=true"
-    )
-    train_dit
-    exit 0
-fi
 
 if [[ "${MODE}" == "vae" || "${MODE}" == "all" ]]; then
     train_vae

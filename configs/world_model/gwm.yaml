@@ -18,24 +18,24 @@ model:
 
 # Gaussian Splat parameters
 observation:
-  use_gs: false
+  use_gs: true
   point_cloud_size: 2048
 
 # 3D VAE parameters
 vae:
-  # This public DiT uses a square 2D latent grid. Use the trained 8x8 VAE.
   use_vae: true
-  num_latents: 64
+  model_dim: 512
+  num_latents: 512
   latent_dim: 64
-  # Must match the VAE checkpoint. New dense VAEs use 2048; legacy ones null.
   decoder_num_queries: null
   vae_depth: 4
-  use_kl: false
+  use_kl: true
+  min_scale: 1.0e-5
   pretrained_path: ${paths.checkpoint_root}/vae/${paths.date}/checkpoint-latest.pth
 
 # Reward model parameters
 reward:
-  use_reward_model: true
+  use_reward_model: false
   reward_weight: 1.0
 
 symlog: true
@@ -50,9 +50,6 @@ diffusion:
   # Standard EDM perturbation from the paper; no channel-wise offset noise.
   sigma_offset_noise: 0.0
   noise_previous_obs: false
-  # Start with teacher forcing. Enable only for a later rollout fine-tuning
-  # stage after stable one-step prediction has been established.
-  autoregressive_training: false
   # Paper Appendix B.1 uses P_mean=-0.4 and P_std=1.2.
   sigma_loc: -0.4
   sigma_scale: 1.2

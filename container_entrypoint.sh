@@ -7,12 +7,19 @@ export PYTHONPATH="${GWM_ROOT}:${GWM_ROOT}/third_party/splatt3r:${GWM_ROOT}/thir
 
 "${GWM_ROOT}/container_setup.sh"
 
+PERSISTED_CODEX_BIN=/root/.codex/packages/standalone/current/codex
+if [[ -x "${PERSISTED_CODEX_BIN}" ]]; then
+    # /root/.codex is persisted, while /usr/local/bin belongs to each new
+    # container. Restore the command link whenever the container is recreated.
+    ln -sfn "${PERSISTED_CODEX_BIN}" /usr/local/bin/codex
+fi
+
 if [[ "${CODEX_REMOTE_CONTROL:-1}" == "1" ]]; then
     CODEX_BIN="$(command -v codex 2>/dev/null || true)"
-    if [[ -z "${CODEX_BIN}" && -x /root/.codex/packages/standalone/current/codex ]]; then
+    if [[ -z "${CODEX_BIN}" && -x "${PERSISTED_CODEX_BIN}" ]]; then
         # The persisted managed CLI is available before editor integrations
         # have had a chance to add `codex` to PATH in a fresh container.
-        CODEX_BIN=/root/.codex/packages/standalone/current/codex
+        CODEX_BIN="${PERSISTED_CODEX_BIN}"
     fi
 
     if [[ -n "${CODEX_BIN}" ]]; then

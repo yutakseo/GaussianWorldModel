@@ -12,26 +12,32 @@ paths:
 
 # Training settings
 train:
-  batch_size: 16
+  # Each trajectory contributes segment_length Gaussian states. Keeping this
+  # small bounds memory for the differentiable rendering objective.
+  batch_size: 2
   epochs: 100
   accum_iter: 1
   # Enable CUDA AMP and GradScaler for the VAE update.
   amp: true
   eval_every: 5  # Evaluate every N epochs
   save_every: 10  # Save checkpoint every N epochs
+  max_batches_per_epoch: null
+  max_eval_batches: null
 
 # During the first epoch, save frozen Splatt3r + FPS outputs here. Later
 # epochs reuse these point clouds instead of recomputing them.
 gaussian_cache:
   enabled: true
-  # v2 uses correct Splatt3r image normalization and raw SH coefficients.
+  # v3 stores FPS Gaussians together with intrinsics estimated before FPS.
   dir: ${paths.cache_root}/vae/${paths.date}/gaussian_features
   dtype: float16  # Set to float32 for an exact, larger cache.
 
 # Optimizer settings
 optimizer:
-  lr: null  # Will be calculated from blr if not specified
-  blr: 1e-4  # Base learning rate
+  # Use an explicit learning rate; linear 256-sample scaling makes the
+  # rendering-loss batches pathologically small.
+  lr: 1e-4
+  blr: 1e-4
   epochs: ${train.epochs}
   warmup_epochs: 5
   weight_decay: 0.05

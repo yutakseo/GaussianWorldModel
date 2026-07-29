@@ -75,6 +75,8 @@ created by container setup.
 ## 🏞️ Pretraining
 
 See [docs/pretraining.md](docs/pretraining.md).
+The paper-to-code mapping and compatibility boundary are documented in
+[docs/paper_alignment.md](docs/paper_alignment.md).
 
 Inside the configured container, no additional virtual environment is needed:
 

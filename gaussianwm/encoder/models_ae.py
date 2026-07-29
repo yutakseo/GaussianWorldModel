@@ -184,6 +184,49 @@ class DiagonalGaussianDistribution(object):
     def mode(self):
         return self.mean
 
+
+class GaussianOutputTransform(nn.Module):
+    """Convert unconstrained decoder channels to physical Gaussians."""
+
+    def __init__(self, min_scale=1.0e-5):
+        super().__init__()
+        self.min_scale = float(min_scale)
+
+    def forward(self, raw):
+        means = raw[..., 0:3]
+        scales = F.softplus(raw[..., 3:6]) + self.min_scale
+
+        rotations = raw[..., 6:10]
+        rotation_norm = rotations.norm(dim=-1, keepdim=True)
+        identity = torch.zeros_like(rotations)
+        identity[..., 0] = 1.0
+        rotations = torch.where(
+            rotation_norm > 1.0e-8,
+            rotations / rotation_norm.clamp_min(1.0e-8),
+            identity,
+        )
+
+        sh = raw[..., 10:13]
+        opacities = raw[..., 13:14].sigmoid()
+        return torch.cat((means, scales, rotations, sh, opacities), dim=-1)
+
+
+def initialize_gaussian_output(
+    layer, initial_scale=1.0e-2, initial_opacity=0.95
+):
+    """Initialize the Gaussian head in a valid rasterization regime."""
+    if not isinstance(layer, nn.Linear) or layer.out_features != 14:
+        return
+
+    with torch.no_grad():
+        layer.bias.zero_()
+        scale = max(float(initial_scale) - 1.0e-5, 1.0e-8)
+        layer.bias[3:6] = np.log(np.expm1(scale))
+        layer.bias[6] = 1.0
+        opacity = min(max(float(initial_opacity), 1.0e-5), 1.0 - 1.0e-5)
+        layer.bias[13] = np.log(opacity / (1.0 - opacity))
+
+
 class AutoEncoder(nn.Module):
     def __init__(
         self,
@@ -199,6 +242,7 @@ class AutoEncoder(nn.Module):
         dim_head=64,
         weight_tie_layers=False,
         decoder_ff=False,
+        min_scale=1.0e-5,
     ):
         super().__init__()
 
@@ -243,6 +287,12 @@ class AutoEncoder(nn.Module):
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
 
         self.to_outputs = nn.Linear(queries_dim, output_dim) if exists(output_dim) else nn.Identity()
+        self.output_transform = (
+            GaussianOutputTransform(min_scale=min_scale)
+            if output_dim == 14
+            else nn.Identity()
+        )
+        initialize_gaussian_output(self.to_outputs)
 
     def encode(self, pc):
         # pc: B x N x D (D=14: xyz + features)
@@ -292,7 +342,7 @@ class AutoEncoder(nn.Module):
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)
         
-        return self.to_outputs(latents)
+        return self.output_transform(self.to_outputs(latents))
 
     def forward(self, pc, queries):
         x = self.encode(pc)
@@ -318,7 +368,8 @@ class KLAutoEncoder(nn.Module):
         heads = 8,
         dim_head = 64,
         weight_tie_layers = False,
-        decoder_ff = False
+        decoder_ff = False,
+        min_scale=1.0e-5,
     ):
         super().__init__()
 
@@ -363,6 +414,12 @@ class KLAutoEncoder(nn.Module):
         self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
 
         self.to_outputs = nn.Linear(queries_dim, output_dim) if exists(output_dim) else nn.Identity()
+        self.output_transform = (
+            GaussianOutputTransform(min_scale=min_scale)
+            if output_dim == 14
+            else nn.Identity()
+        )
+        initialize_gaussian_output(self.to_outputs)
 
         self.proj = nn.Linear(latent_dim, dim)
 
@@ -397,7 +454,7 @@ class KLAutoEncoder(nn.Module):
         logvar = self.logvar_fc(x)
 
         posterior = DiagonalGaussianDistribution(mean, logvar)
-        x = posterior.sample()
+        x = posterior.sample() if self.training else posterior.mode()
         kl = posterior.kl()
 
         return kl, x
@@ -426,7 +483,7 @@ class KLAutoEncoder(nn.Module):
         if exists(self.decoder_ff):
             latents = latents + self.decoder_ff(latents)
         
-        return self.to_outputs(latents)
+        return self.output_transform(self.to_outputs(latents))
 
     def forward(self, pc, queries=None):
         kl, x = self.encode(pc)
@@ -438,7 +495,7 @@ class KLAutoEncoder(nn.Module):
 
 def create_autoencoder(
         dim=512, M=512, depth=24, latent_dim=64, output_dim=1, N=2048,
-        deterministic=False, decoder_num_queries=None
+        deterministic=False, decoder_num_queries=None, min_scale=1.0e-5,
     ):
     if deterministic:
         model = AutoEncoder(
@@ -451,6 +508,7 @@ def create_autoencoder(
             decoder_num_queries=decoder_num_queries,
             heads=8,
             dim_head=64,
+            min_scale=min_scale,
         )
     else:
         model = KLAutoEncoder(
@@ -464,6 +522,7 @@ def create_autoencoder(
             latent_dim=latent_dim,
             heads=8,
             dim_head=64,
+            min_scale=min_scale,
         )
     return model
 

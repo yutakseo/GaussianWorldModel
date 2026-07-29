@@ -297,6 +297,24 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
+def _vae_architecture_metadata(args):
+    vae = args.vae
+    return {
+        "representation": "gaussian_vae",
+        "model_dim": int(vae.model_dim),
+        "num_inputs": int(vae.point_cloud_size),
+        "num_latents": int(vae.num_latents),
+        "latent_dim": int(vae.latent_dim),
+        "decoder_num_queries": (
+            int(vae.decoder_num_queries)
+            if vae.decoder_num_queries is not None
+            else None
+        ),
+        "use_kl": bool(vae.use_kl),
+        "output_dim": int(vae.output_dim),
+    }
+
+
 def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     checkpoint_dir = Path(args.checkpoint_dir)
     epoch_name = str(epoch)
@@ -312,6 +330,8 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
+                'format_version': 2,
+                'architecture': _vae_architecture_metadata(args),
             }
 
             if is_main_process():
@@ -337,6 +357,14 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
+        architecture = checkpoint.get("architecture")
+        expected_architecture = _vae_architecture_metadata(args)
+        if architecture != expected_architecture:
+            raise ValueError(
+                "VAE checkpoint architecture does not match the configured "
+                "paper-aligned model. Expected "
+                f"{expected_architecture}, got {architecture}."
+            )
         model_without_ddp.load_state_dict(checkpoint['model'])
         print("Resume checkpoint %s" % args.resume)
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):

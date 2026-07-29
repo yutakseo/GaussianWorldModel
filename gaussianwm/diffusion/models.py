@@ -11,6 +11,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -35,6 +36,7 @@ class InnerModelConfig:
     class_dropout_prob: float
     learn_sigma: bool
     context_length: int
+    token_based: bool = False
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -320,6 +322,204 @@ class DiT(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
+
+
+def _rotate_half(x):
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+
+def _apply_rope(x):
+    """Apply one-dimensional rotary position embeddings to token heads."""
+    sequence_length = x.shape[-2]
+    head_dim = x.shape[-1]
+    if head_dim % 2:
+        raise ValueError("RoPE requires an even attention head dimension")
+    positions = torch.arange(
+        sequence_length, device=x.device, dtype=torch.float32
+    )
+    frequencies = torch.exp(
+        -math.log(10000.0)
+        * torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32)
+        / head_dim
+    )
+    angles = positions[:, None] * frequencies[None]
+    cos = torch.repeat_interleave(angles.cos(), 2, dim=-1).to(x.dtype)
+    sin = torch.repeat_interleave(angles.sin(), 2, dim=-1).to(x.dtype)
+    return x * cos[None, None] + _rotate_half(x) * sin[None, None]
+
+
+class RotarySelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        if hidden_size % num_heads:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x):
+        batch, tokens, channels = x.shape
+        qkv = self.qkv(x).reshape(
+            batch, tokens, 3, self.num_heads, self.head_dim
+        )
+        q, k, v = qkv.unbind(dim=2)
+        q = _apply_rope(q.transpose(1, 2))
+        k = _apply_rope(k.transpose(1, 2))
+        v = v.transpose(1, 2)
+        attended = F.scaled_dot_product_attention(q, k, v)
+        attended = attended.transpose(1, 2).reshape(batch, tokens, channels)
+        return self.proj(attended)
+
+
+class GaussianDiTBlock(nn.Module):
+    """RMSNorm DiT block with RoPE and action cross-attention."""
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm_self = nn.RMSNorm(hidden_size)
+        self.self_attn = RotarySelfAttention(hidden_size, num_heads)
+        self.norm_action = nn.RMSNorm(hidden_size)
+        self.norm_action_tokens = nn.RMSNorm(hidden_size)
+        self.action_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, batch_first=True
+        )
+        self.norm_mlp = nn.RMSNorm(hidden_size)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 7 * hidden_size, bias=True),
+        )
+
+    def forward(self, x, time_condition, action_tokens):
+        (
+            shift_self,
+            scale_self,
+            gate_self,
+            gate_action,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = self.adaLN_modulation(time_condition).chunk(7, dim=1)
+
+        self_input = modulate(
+            self.norm_self(x), shift_self, scale_self
+        )
+        x = x + gate_self.unsqueeze(1) * self.self_attn(self_input)
+
+        normalized_action = self.norm_action_tokens(action_tokens)
+        action_output, _ = self.action_attn(
+            self.norm_action(x),
+            normalized_action,
+            normalized_action,
+            need_weights=False,
+        )
+        x = x + gate_action.unsqueeze(1) * action_output
+
+        mlp_input = modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_input)
+        return x
+
+
+class GaussianDiT(nn.Module):
+    """Token DiT for the paper's unordered Gaussian VAE latent points."""
+
+    def __init__(
+        self,
+        num_tokens,
+        in_channels,
+        action_dim,
+        hidden_size,
+        depth,
+        num_heads,
+        mlp_ratio,
+        context_length,
+    ):
+        super().__init__()
+        self.num_tokens = int(num_tokens)
+        self.latent_channels = int(in_channels)
+        input_channels = self.latent_channels * (context_length + 1)
+        self.input_projection = nn.Linear(input_channels, hidden_size)
+        self.noise_embedding = TimestepEmbedder(hidden_size)
+        self.condition_noise_embedding = TimestepEmbedder(hidden_size)
+        self.action_projection = nn.Sequential(
+            nn.Linear(action_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.blocks = nn.ModuleList(
+            GaussianDiTBlock(hidden_size, num_heads, mlp_ratio)
+            for _ in range(depth)
+        )
+        self.final_norm = nn.RMSNorm(hidden_size)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, hidden_size * 2)
+        )
+        self.output_projection = nn.Linear(hidden_size, self.latent_channels)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def initialize(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        self.apply(initialize)
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN_modulation[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    @staticmethod
+    def _to_tokens(tensor):
+        return tensor.flatten(2).transpose(1, 2)
+
+    def forward(self, noisy_next_obs, c_noise, c_noise_cond, obs, act=None):
+        noisy_tokens = self._to_tokens(noisy_next_obs)
+        context_tokens = self._to_tokens(obs)
+        if noisy_tokens.shape[1] != self.num_tokens:
+            raise ValueError(
+                f"Expected {self.num_tokens} Gaussian tokens, "
+                f"got {noisy_tokens.shape[1]}"
+            )
+        x = self.input_projection(
+            torch.cat((context_tokens, noisy_tokens), dim=-1)
+        )
+
+        time_condition = (
+            self.noise_embedding(c_noise)
+            + self.condition_noise_embedding(c_noise_cond)
+        )
+        if act is None:
+            action_tokens = torch.zeros(
+                x.shape[0], 1, x.shape[-1], device=x.device, dtype=x.dtype
+            )
+        else:
+            if act.ndim == 2:
+                act = act.unsqueeze(1)
+            action_tokens = self.action_projection(act)
+
+        hidden_states = []
+        for block in self.blocks:
+            x = block(x, time_condition, action_tokens)
+            hidden_states.append(x)
+
+        shift, scale = self.final_modulation(time_condition).chunk(2, dim=1)
+        x = modulate(self.final_norm(x), shift, scale)
+        x = self.output_projection(x)
+        output = x.transpose(1, 2).reshape(
+            x.shape[0], self.latent_channels, 1, self.num_tokens
+        )
+        return output, hidden_states
 
 
 #################################################################################

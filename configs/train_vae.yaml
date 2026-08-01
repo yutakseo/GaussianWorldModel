@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 # VAE uses its own seed while sharing runtime/device/distributed settings.
-seed: 0
+seed: 42
 paths:
   stage: vae
 
@@ -14,7 +14,7 @@ paths:
 train:
   # Each trajectory contributes segment_length Gaussian states. Keeping this
   # small bounds memory for the differentiable rendering objective.
-  batch_size: 2
+  batch_size: 24
   epochs: 100
   accum_iter: 1
   # Enable CUDA AMP and GradScaler for the VAE update.
